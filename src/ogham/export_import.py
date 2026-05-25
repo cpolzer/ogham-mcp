@@ -70,7 +70,20 @@ def _build_row(
     profile: str,
     expires_at: str | None,
 ) -> dict[str, Any]:
-    """Build a row dict ready for database insertion."""
+    """Build a row dict ready for database insertion.
+
+    NOTE: deliberately does NOT carry ``mem["created_at"]`` into the row.
+    The ``memories`` table has ``DEFAULT now()`` on ``created_at``, which
+    means every imported memory is timestamped at INGEST time, not at the
+    historical date the source records (e.g. Claude.ai conversation date).
+    Compaction logic in ``ogham.compression.get_compression_target`` keys
+    on ``created_at``; passing through the original date here would cause
+    backdated imports to compact immediately on insert (cdeust/Cortex hit
+    this bug 2026-05; their fix was a ``created_at -> ingested_at`` rename
+    that recovered MRR_with_consolidation 0.222 -> 0.8264). Importers
+    should put historical dates in ``metadata`` instead (see
+    ``claude_ai_import.py`` -> ``metadata.claude_created_at``).
+    """
     row = {
         "content": mem["content"],
         "embedding": str(embedding),

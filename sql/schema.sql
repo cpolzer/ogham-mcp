@@ -1087,3 +1087,34 @@ $$;
 -- full rationale.
 REVOKE EXECUTE ON FUNCTION refresh_entity_temporal_span(bigint) FROM anon, authenticated, PUBLIC;
 REVOKE EXECUTE ON FUNCTION spread_entity_activation_memories(text[], text, integer, double precision, double precision, integer) FROM anon, authenticated, PUBLIC;
+
+-- =====================================================
+-- PostgREST / Supabase Data API grants (added 2026-05)
+-- =====================================================
+-- On 2026-04-28 Supabase announced that tables created in `public`
+-- will no longer be auto-exposed to the Data API. The change becomes
+-- the default for new projects on 2026-05-30 and is enforced on all
+-- existing projects on 2026-10-30.
+-- Source: https://github.com/orgs/supabase/discussions/45329
+--
+-- Ogham's Python backend talks to Supabase via PostgREST using the
+-- service_role / sb_secret_ key. Without explicit table-level
+-- GRANTs, PostgREST returns "42501: permission denied" once Supabase
+-- revokes its platform-level default grant.
+--
+-- Granted to service_role only. anon is blocked at the RLS layer
+-- ("Deny anon access" policies on every table) and locked out of RPC
+-- EXECUTE in migration 037. authenticated is unused by Ogham.
+--
+-- Migration 038_data_api_grants.sql provides the upgrade path for
+-- existing self-hosted installs and also covers topic_summaries +
+-- topic_summary_sources (created by migration 028).
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.memories             TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.profile_settings     TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.memory_lifecycle     TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.memory_relationships TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.audit_log            TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.entities             TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.memory_entities      TO service_role;
+
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO service_role;

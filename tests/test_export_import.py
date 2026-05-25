@@ -417,3 +417,37 @@ def test_batch_check_duplicates_empty():
 
     assert result == []
     mock_client.return_value.rpc.assert_not_called()
+
+
+# Regression: _build_row must NOT carry created_at into the insert row.
+#
+# Why: the memories table defaults created_at to now(), which makes
+# Ogham's "created_at" column effectively "ingested_at". Compaction
+# reads created_at to compute age. If _build_row started passing the
+# original timestamp from imports (e.g. Claude.ai's historical
+# conversation dates) into the row, every backdated import would
+# compact immediately on insert. cdeust/Cortex hit this exact bug in
+# May 2026 -- their fix recovered MRR 0.222 -> 0.8264 on backdated
+# corpora. Pinning this here so a future contributor can't silently
+# regress us into the same hole.
+def test_build_row_does_not_carry_created_at_for_compaction_safety():
+    from ogham.export_import import _build_row
+
+    mem = {
+        "content": "old conversation from 2024",
+        "tags": ["source:claude-ai"],
+        "metadata": {"claude_created_at": "2024-09-13T09:13:28Z"},
+        "created_at": "2024-09-13T09:13:28Z",  # historical, must NOT propagate
+        "source": "claude-ai",
+    }
+    row = _build_row(mem, embedding=[0.0] * 4, profile="default", expires_at=None)
+
+    assert "created_at" not in row, (
+        "_build_row must NOT pass created_at into the insert row. The DB "
+        "default of now() must fire on every insert so compaction logic "
+        "(ogham.compression.get_compression_target) sees the ingest time, "
+        "not the historical source date. See cdeust/Cortex commit 6c51bce "
+        "(May 2026) for the bug class this guards against."
+    )
+    # Sanity: the historical date is preserved where it should be -- in metadata.
+    assert row["metadata"]["claude_created_at"] == "2024-09-13T09:13:28Z"

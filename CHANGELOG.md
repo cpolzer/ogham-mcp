@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.14.3] - 2026-05-25 -- Supabase Data API explicit grants
+
+### Added
+
+- **Migration 038: explicit Data API grants for `service_role`.**
+  Supabase is changing a platform default
+  ([announcement](https://github.com/orgs/supabase/discussions/45329)):
+  new tables in the `public` schema are no longer automatically exposed
+  to the Data API (PostgREST / GraphQL / supabase-js). This becomes the
+  default for new projects on 2026-05-30 and applies to all existing
+  projects on 2026-10-30.
+
+  Ogham reaches Supabase through PostgREST with the `service_role` /
+  `sb_secret_` key. Without explicit table-level grants, requests start
+  failing with `42501: permission denied` once Supabase removes the old
+  default. Migration 038 adds the required
+  `GRANT SELECT, INSERT, UPDATE, DELETE` on every Ogham table to
+  `service_role`. `anon` stays denied at the RLS layer; nothing else
+  about the access model changes.
+
+  The grants are wrapped in a role-existence guard, so on vanilla
+  Postgres or Neon (no `service_role`) the migration is a clean no-op.
+  Fresh installs pick the grants up from `schema.sql` automatically;
+  `schema_selfhost_supabase.sql` carries them too. A `DANGER_038`
+  rollback is included for the rare case you need to revert.
+
+  **Self-hosting on Supabase?** Apply `sql/migrations/038_data_api_grants.sql`
+  before the October 30 enforcement date -- or run it now to get ahead
+  of it. Neon and vanilla-Postgres backends are unaffected.
+
 ## [0.14.2] - 2026-05-05 -- compress_old_memories Postgres fetch fix
 
 ### Fixed

@@ -1574,7 +1574,7 @@ wheels = [
 
 [[package]]
 name = "ogham-mcp"
-version = "0.14.2"
+version = "0.14.3"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
