@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.15.1] - 2026-06-18 -- Supabase OKF round-trip hotfix
+
+### Fixed
+
+- **Supabase upsert was silently doing plain INSERT.** The
+  `SupabaseBackend` client was being initialised with a global
+  `Prefer: return=representation` header. The postgrest client's
+  per-call `upsert()` builds its own Prefer header containing
+  `resolution=merge-duplicates`, but the global header silently
+  overwrote it during a `headers.update(self.headers)` merge step.
+  Result: every Supabase upsert hit the plain-INSERT path, and the
+  second OKF re-import failed with
+  `duplicate key value violates unique constraint memories_pkey`.
+  This affected anyone re-importing an OKF bundle into the same
+  profile. Fix: drop the global Prefer header (each operation builds
+  its own correctly) and pass `on_conflict="id"` explicitly to the
+  upsert call. A regression test pins both the absent global header
+  and the per-call Prefer + on_conflict combination.
+
+- **`ogham import <okf-bundle-dir>` crashed with `IsADirectoryError`.**
+  The CLI shell wrapper around `import_memories_tool` unconditionally
+  called `open(file)` to read JSON/markdown payloads, even though the
+  MCP tool already auto-detects OKF bundle directories. Fix: branch
+  on `os.path.isdir(file)` and pass the directory path through as-is
+  for OKF bundles. Existing JSON/markdown imports keep their read flow.
+
+- **`ogham export --help` did not list `okf` as a valid format.** The
+  underlying code accepted it; only the typer help text was stale.
+
 ## [0.15.0] - 2026-06-18 -- Open Knowledge Format + offline bundle viewer
 
 ### Added

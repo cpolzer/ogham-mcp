@@ -56,7 +56,18 @@ class SupabaseBackend:
                     headers={
                         "apikey": settings.supabase_key,
                         "Authorization": f"Bearer {settings.supabase_key}",
-                        "Prefer": "return=representation",
+                        # Do NOT set a global Prefer header here. The postgrest-py
+                        # operation builders (pre_insert / pre_upsert / pre_update)
+                        # construct the correct Prefer header per call -- including
+                        # `resolution=merge-duplicates` for upserts. The client's
+                        # `headers.update(self.headers)` then merges the global
+                        # headers into the per-call headers, SILENTLY OVERWRITING
+                        # the per-call Prefer with the global one. Setting a
+                        # global "Prefer: return=representation" here caused
+                        # upsert_memory to fall through to plain INSERT and fail
+                        # with duplicate-key on the second import (v0.15.0 bug
+                        # caught during the OKF demo). Each operation builds its
+                        # own Prefer correctly -- leave it to them.
                     },
                     timeout=120,
                 )
@@ -142,7 +153,11 @@ class SupabaseBackend:
             warnings.simplefilter("ignore", DeprecationWarning)
             result = (
                 client.from_("memories")
-                .upsert(row, returning=ReturnMethod.representation)
+                .upsert(
+                    row,
+                    returning=ReturnMethod.representation,
+                    on_conflict="id",
+                )
                 .execute()
             )
         if not result.data:

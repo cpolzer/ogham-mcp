@@ -489,7 +489,9 @@ def cleanup(
 @app.command(name="export")
 def export_cmd(
     profile: str = typer.Option(None, help="Profile to export"),
-    format: str = typer.Option("json", help="Output format: json or markdown"),
+    format: str = typer.Option(
+        "json", help="Output format: json, markdown, or okf (OKF v0.1 bundle directory)"
+    ),
     output: Optional[str] = typer.Option(
         None, "--output", "-o", help="Output file (stdout if omitted)"
     ),
@@ -563,8 +565,16 @@ def import_cmd(
 
     target = profile or settings.default_profile
 
-    with open(file) as f:
-        data = f.read()
+    # OKF v0.1 bundles are directories, not files. Hand the path through to
+    # the importer as a string -- import_memories auto-detects bundle dirs.
+    # JSON/markdown exports are still single files we read into memory.
+    import os
+
+    if os.path.isdir(file):
+        data = file
+    else:
+        with open(file) as f:
+            data = f.read()
 
     with Progress(
         SpinnerColumn(),
