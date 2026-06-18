@@ -509,6 +509,7 @@ def hybrid_search(
     profiles: ListStr = None,
     extract_facts: bool = False,
     wiki_preamble_level: str = "short",
+    gap: str | None = "auto",
 ) -> dict[str, Any]:
     """Search memories in the active profile by meaning and keywords (hybrid search).
 
@@ -516,12 +517,17 @@ def hybrid_search(
     using Reciprocal Rank Fusion. Finds both conceptually similar memories and exact
     keyword matches.
 
-    Returns ``{"results": [...memory rows...], "wiki_preamble": [...wiki summaries...]}``.
+    Returns ``{"results": [...memory rows...], "wiki_preamble": [...wiki summaries...],
+    "gap_note": <dict|str|None>}``.
     The split (new in v0.12.1) keeps benchmark scorers and downstream pipelines clean:
     they see a deterministic list of retrieval hits in ``results``, and a separate
     optional list of compiled topic summaries in ``wiki_preamble``. ``wiki_preamble``
     is always present; it's an empty list when wiki injection is off, the embedding
-    can't be generated, or no summary clears the similarity threshold.
+    can't be generated, or no summary clears the similarity threshold. ``gap_note``
+    is null unless the result set has a material gap (stale, low-confidence, or
+    contradicted); read it before relying on the results. Set ``gap="deep"`` when
+    you are about to act on the results to also surface contradictions with
+    memories that did not rank, and ``gap="prose"`` for a short written heads-up.
 
     Args:
         query: Natural language search query. Also used for keyword matching.
@@ -541,6 +547,11 @@ def hybrid_search(
                   summary), 'one_line' (~30-50 tokens), or 'body' (~1000-2000
                   tokens, the v0.12 default). Use 'body' for benchmark parity
                   with v0.12 runs; 'short' is the typical-cost default.
+        gap: Gap-analysis level. "auto" (default) computes in-result signals and
+                  attaches a dict when material; "deep" also runs an out-of-result
+                  contradiction lookup; "prose" narrates the gap with an LLM;
+                  "off" disables gap analysis entirely. Always None under
+                  OGHAM_BENCH_MODE.
     """
     _require_limit(limit)
     from ogham.flow_control import disabled_payload, recall_enabled
@@ -550,6 +561,7 @@ def hybrid_search(
             **disabled_payload("recall"),
             "results": [],
             "wiki_preamble": [],
+            "gap_note": None,
         }
 
     from ogham.embeddings import generate_embedding
@@ -572,7 +584,46 @@ def hybrid_search(
         embedding = generate_embedding(query)
         wiki_preamble = _wiki_injection_results(profile, embedding, level=wiki_preamble_level)
 
-    return {"results": results, "wiki_preamble": wiki_preamble}
+    import os
+    from datetime import datetime, timezone
+
+    from ogham import gap_signals
+
+    gap_note: Any = None
+    bench = os.environ.get("OGHAM_BENCH_MODE", "").lower() in ("true", "1", "yes")
+    if gap and gap != "off" and not bench and results:
+        report = gap_signals.compute_in_result_signals(
+            results,
+            now=datetime.now(timezone.utc),
+            stale_days=settings.gap_stale_days,
+            confidence_floor=settings.gap_confidence_floor,
+        )
+        if gap in ("deep", "prose"):
+            report = gap_signals.compute_deep_signals(
+                report, profile=profile, result_ids=[str(r["id"]) for r in results], tags=tags
+            )
+        if gap_signals.is_material(report):
+            if gap == "prose":
+                # Empty gap_synthesis_* reuses the wiki/recompute synthesis LLM
+                # (settings.llm_provider/llm_model). An empty model id 400s and
+                # silently falls back to the template, so never leave it blank (#262).
+                _llm_prov = getattr(settings, "llm_provider", "ollama")
+                _llm_model = getattr(settings, "llm_model", "llama3.2")
+                prov = settings.gap_synthesis_provider or _llm_prov
+                model = settings.gap_synthesis_model or _llm_model
+                gap_note = gap_signals.narrate(report, provider=prov, model=model)
+            else:
+                gap_note = report.to_dict()
+            from ogham.database import emit_audit_event
+
+            try:
+                emit_audit_event(
+                    operation="gap_note", profile=profile, metadata={"level": gap, "material": True}
+                )
+            except Exception as _audit_exc:  # noqa: BLE001 — audit is best-effort
+                logger.debug("gap_note audit event skipped: %s", _audit_exc)
+
+    return {"results": results, "wiki_preamble": wiki_preamble, "gap_note": gap_note}
 
 
 @mcp.tool
@@ -864,27 +915,39 @@ def set_profile_ttl(profile: str, ttl_days: int | None = None) -> dict[str, Any]
 
 @mcp.tool
 @log_timing("export_profile")
-def export_profile(format: str = "json") -> dict[str, Any]:
+def export_profile(format: str = "json", include_viewer: bool = True) -> dict[str, Any]:
     """Export all memories in the active profile.
 
     Args:
-        format: Output format — "json" or "markdown".
+        format: Output format -- "json", "markdown", or "okf".
+            "okf" writes an OKF v0.1 bundle directory to the current working
+            directory and returns its path in the "data" field.
+        include_viewer: When format="okf", also write a self-contained
+            viewer.html at the bundle root for offline graph browsing.
+            Default True. Ignored for non-OKF formats.
     """
-    if format not in ("json", "markdown"):
-        raise ValueError("format must be 'json' or 'markdown'")
+    if format not in ("json", "markdown", "okf"):
+        raise ValueError("format must be 'json', 'markdown', or 'okf'")
     active_profile = get_active_profile()
-    data = _export_memories(active_profile, format=format)
+    data = _export_memories(active_profile, format=format, include_viewer=include_viewer)
     return {"status": "exported", "profile": active_profile, "format": format, "data": data}
 
 
 @mcp.tool
 @log_timing("import_memories")
 def import_memories_tool(data: str, dedup_threshold: float = 0.8) -> dict[str, Any]:
-    """Import memories into the active profile from a JSON export.
+    """Import memories into the active profile.
 
     Args:
-        data: JSON string from a previous export_profile call.
-        dedup_threshold: Skip memories with similarity above this (0 to disable dedup).
+        data: Either a JSON string from a previous export_profile call, OR the
+              filesystem path to an OKF v0.1 bundle directory returned by
+              export_profile(format='okf'). Shape is auto-detected: if data is
+              a string path to an existing directory, it's treated as an OKF
+              bundle; otherwise as a JSON string.
+        dedup_threshold: Skip memories with similarity above this (0 to disable).
+                         Ignored when data is an OKF bundle path -- OKF imports
+                         upsert by UUID (existing) or insert (new UUID) without
+                         similarity dedup.
     """
     from ogham.flow_control import disabled_payload, inscribe_enabled
 

@@ -394,6 +394,59 @@ class PostgresBackend:
         sql = f"SELECT {_COLUMNS} FROM memories WHERE id = %(id)s AND profile = %(profile)s"
         return self._execute(sql, {"id": memory_id, "profile": profile}, fetch="one")
 
+    def upsert_memory(self, memory: dict[str, Any]) -> dict[str, Any]:
+        """INSERT or UPDATE a memory keyed by ``id`` for OKF round-trip imports.
+
+        ON CONFLICT (id) DO UPDATE overwrites content, tags, metadata, embedding,
+        source, and updated_at. access_count, last_accessed_at, and created_at are
+        PRESERVED -- they are runtime state that should not be clobbered on re-import.
+        Mirrors the ON CONFLICT style used in set_profile_ttl and hebbian_strengthen_edges.
+        """
+        memory_id = memory["id"]
+        embedding = memory.get("embedding")
+        if embedding is None:
+            # The OKF import path always provides an embedding (generated before
+            # calling upsert_memory). A zero-vector placeholder would be accepted
+            # by the DB but cause silent dimension-mismatch errors at query time
+            # when the schema uses a different vector size (e.g. 512 vs 1).
+            raise ValueError(f"upsert_memory requires an embedding for id={memory_id!r}")
+        embedding_literal = _embedding_literal(embedding)
+        row = self._execute(
+            """INSERT INTO memories (id, content, embedding, profile, metadata, source, tags)
+               VALUES (
+                   %(id)s,
+                   %(content)s,
+                   %(embedding)s::vector,
+                   %(profile)s,
+                   %(metadata)s,
+                   %(source)s,
+                   %(tags)s
+               )
+               ON CONFLICT (id) DO UPDATE SET
+                   content      = EXCLUDED.content,
+                   embedding    = EXCLUDED.embedding,
+                   metadata     = EXCLUDED.metadata,
+                   source       = EXCLUDED.source,
+                   tags         = EXCLUDED.tags,
+                   updated_at   = now()
+               RETURNING id, content, metadata, source, profile, tags,
+                         created_at, updated_at, expires_at, access_count,
+                         last_accessed_at, confidence""",
+            {
+                "id": memory_id,
+                "content": memory.get("content", ""),
+                "embedding": embedding_literal,
+                "profile": memory.get("profile", "default"),
+                "metadata": Jsonb(memory.get("metadata") or {}),
+                "source": memory.get("source"),
+                "tags": memory.get("tags") or [],
+            },
+            fetch="one",
+        )
+        if row is None:
+            raise RuntimeError(f"upsert_memory returned no data for id={memory_id!r}")
+        return row
+
     def delete_memory(self, memory_id: str, profile: str) -> bool:
         row = self._execute(
             "DELETE FROM memories WHERE id = %(id)s AND profile = %(profile)s RETURNING id",
@@ -1344,6 +1397,30 @@ class PostgresBackend:
         )
         count, sample = self._split_count_sample(rows or [])
         return {"count": count, "sample": sample}
+
+    def gap_out_of_result_contradictions(
+        self, profile: str, memory_ids: list[str], *, sample_size: int = 10
+    ) -> dict[str, Any]:
+        """Contradiction edges with one endpoint in memory_ids, the other outside it.
+
+        Returns {"count": int, "pairs": [{"in_result_id": .., "other_id": .., "strength": ..}]}.
+        """
+        rows = self._execute(
+            "SELECT * FROM gap_contradictions_for_ids(%(p)s, %(ids)s::uuid[], %(n)s)",
+            {"p": profile, "ids": [str(m) for m in memory_ids], "n": sample_size},
+            fetch="all",
+        )
+        return {
+            "count": rows[0]["total_count"] if rows else 0,
+            "pairs": [
+                {
+                    "in_result_id": r["in_result_id"],
+                    "other_id": r["other_id"],
+                    "strength": r["strength"],
+                }
+                for r in rows
+            ],
+        }
 
     def wiki_lint_orphans(
         self, profile: str, sample_size: int = 10, grace_minutes: int = 5

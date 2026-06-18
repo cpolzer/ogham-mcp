@@ -262,7 +262,7 @@ def test_hybrid_search_tool_returns_split_response_with_preamble_when_flag_on():
         out = memory_tools.hybrid_search(query="quantum", limit=10)
 
     assert isinstance(out, dict)
-    assert set(out.keys()) == {"results", "wiki_preamble"}
+    assert {"results", "wiki_preamble", "gap_note"} <= set(out.keys())
     assert out["results"] == fake_results
     assert out["wiki_preamble"] == fake_preamble
 
@@ -283,7 +283,9 @@ def test_hybrid_search_tool_returns_empty_preamble_when_flag_off():
         out = memory_tools.hybrid_search(query="quantum", limit=10)
 
     mock_inject.assert_not_called()
-    assert out == {"results": fake_results, "wiki_preamble": []}
+    assert out["results"] == fake_results
+    assert out["wiki_preamble"] == []
+    assert "gap_note" in out
 
 
 def test_hybrid_search_tool_extract_facts_skips_injection_and_keeps_split():
@@ -303,7 +305,9 @@ def test_hybrid_search_tool_extract_facts_skips_injection_and_keeps_split():
         out = memory_tools.hybrid_search(query="quantum", limit=10, extract_facts=True)
 
     mock_inject.assert_not_called()
-    assert out == {"results": fake_results, "wiki_preamble": []}
+    assert out["results"] == fake_results
+    assert out["wiki_preamble"] == []
+    assert "gap_note" in out
 
 
 # --------------------------------------------------------------------- #

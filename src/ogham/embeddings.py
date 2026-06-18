@@ -11,6 +11,7 @@ such as `model`, `input_tokens`, and `cache_hit`.
 import hashlib
 import logging
 import math
+import os
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -555,6 +556,14 @@ def _embed_voyage_batch(
     return all_embeddings
 
 
+class _GeminiShortResponseError(RuntimeError):
+    """Gemini batchEmbedContents returned fewer embeddings than items submitted.
+
+    Observed as a transient: an immediate retry typically returns a full
+    response. See OM-mcp issue #60.
+    """
+
+
 def _is_rate_limit_error(exc: BaseException) -> bool:
     """Detect Gemini 429/quota/503 errors that are worth retrying."""
     msg = str(exc)
@@ -565,6 +574,11 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
         or "503" in msg
         or "UNAVAILABLE" in msg
     )
+
+
+def _is_transient_gemini_error(exc: BaseException) -> bool:
+    """Tenacity predicate: rate-limit OR transient short-response failure."""
+    return isinstance(exc, _GeminiShortResponseError) or _is_rate_limit_error(exc)
 
 
 def _embed_gemini_batch(
@@ -583,9 +597,18 @@ def _embed_gemini_batch(
         wait_exponential,
     )
 
+    # OGHAM_RETRY_FAST collapses tenacity backoff for tests: the real call
+    # chain stays at the production schedule, only test runs short-circuit it.
+    _fast = bool(os.environ.get("OGHAM_RETRY_FAST"))
+    _wait = (
+        wait_exponential(multiplier=0, min=0, max=0)
+        if _fast
+        else wait_exponential(multiplier=3, min=3, max=90)
+    )
+
     @retry(
-        retry=retry_if_exception(_is_rate_limit_error),
-        wait=wait_exponential(multiplier=3, min=3, max=90),
+        retry=retry_if_exception(_is_transient_gemini_error),
+        wait=_wait,
         stop=stop_after_attempt(6),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
@@ -596,6 +619,11 @@ def _embed_gemini_batch(
             contents=texts,
             config={"output_dimensionality": settings.embedding_dim},
         )
+        if len(response.embeddings) != len(texts):
+            raise _GeminiShortResponseError(
+                f"Gemini returned {len(response.embeddings)} embeddings for "
+                f"{len(texts)} inputs -- short response, retrying"
+            )
         embeddings = [e.values for e in response.embeddings]
         for emb in embeddings:
             _validate_dim(emb)

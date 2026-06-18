@@ -33,6 +33,24 @@ class DatabaseBackend(Protocol):
         rows: list[dict[str, Any]],
     ) -> list[dict[str, Any]]: ...
 
+    def upsert_memory(
+        self,
+        memory: dict[str, Any],
+    ) -> dict[str, Any]:
+        """INSERT or UPDATE a memory keyed by ``id``.
+
+        Used by OKF imports to support round-trip semantics: if a memory with
+        the given UUID already exists it is updated (content, tags, metadata,
+        embedding, source, updated_at are overwritten); access_count,
+        last_accessed_at, and created_at are PRESERVED -- they are runtime
+        state that should not be clobbered on a re-import.
+
+        ``memory`` must have an ``"id"`` key and an ``"embedding"`` key (the
+        caller is responsible for generating the embedding before calling this).
+        Other recognised keys match the ``store_memory`` signature.
+        """
+        ...
+
     def update_memory(
         self,
         memory_id: str,

@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     mistral_embed_model: str = "mistral-embed"
     voyage_embed_model: str = "voyage-4-lite"
-    gemini_embed_model: str = "gemini-embedding-2-preview"
+    gemini_embed_model: str = "gemini-embedding-2"
 
     onnx_model_path: str = ""
 
@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     rerank_enabled: bool = False
     rerank_model: str = "flashrank"  # "flashrank" or "bge"
     rerank_alpha: float = 0.55
+
+    # Gap-analysis (task #262). stale_days mirrors wiki_lint._DEFAULT_STABLE_DAYS.
+    gap_stale_days: int = 90
+    gap_confidence_floor: float = 0.5
+    # Empty = reuse the wiki/recompute synthesis provider+model for prose narration.
+    gap_synthesis_provider: str = ""
+    gap_synthesis_model: str = ""
 
     # Wiki Tier 1 (v0.12.1) -- prepend top-K matching topic_summaries to
     # the MCP `hybrid_search` tool's results as a context-injection layer.

@@ -118,15 +118,27 @@ _config_cache: dict[str, Any] | None = None
 def _load_config() -> dict[str, Any]:
     """Load hooks config from YAML file, with caching.
 
-    Looks for hooks_config.yaml next to this module, then falls back
-    to hardcoded defaults. Config is cached after first load.
+    Resolves hooks_config.yaml from the v0.9 shared-data artifact, with
+    fallbacks for source-tree and legacy-wheel layouts:
+
+      1. ``shared/hooks_config.yaml`` at the repo root (dev / source tree)
+      2. ``ogham/_shared/hooks_config.yaml`` (wheel-installed, vendored)
+      3. ``ogham/hooks_config.yaml`` (pre-v0.9 in-package layout)
+
+    Config is cached after first load.
     """
     global _config_cache
     if _config_cache is not None:
         return _config_cache
 
-    config_path = Path(__file__).parent / "hooks_config.yaml"
-    if config_path.exists():
+    here = Path(__file__).parent
+    candidates = [
+        here.parent.parent / "shared" / "hooks_config.yaml",
+        here / "_shared" / "hooks_config.yaml",
+        here / "hooks_config.yaml",
+    ]
+    config_path = next((p for p in candidates if p.exists()), None)
+    if config_path is not None:
         try:
             import yaml
 

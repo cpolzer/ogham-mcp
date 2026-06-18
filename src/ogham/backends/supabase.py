@@ -106,6 +106,51 @@ class SupabaseBackend:
             )
         return _rows(result.data)
 
+    def upsert_memory(self, memory: dict[str, Any]) -> dict[str, Any]:
+        """INSERT or UPDATE a memory keyed by ``id`` for OKF round-trip imports.
+
+        Uses PostgREST upsert (POST with Prefer: resolution=merge-duplicates).
+        Overwrites content, tags, metadata, embedding, source on conflict.
+        access_count, last_accessed_at, created_at are preserved by the DB
+        (only EXCLUDED columns are in the upsert payload; those columns have no
+        EXCLUDED value so Postgres keeps the existing row values).
+        """
+        row = {
+            "id": memory["id"],
+            "content": memory.get("content", ""),
+            "profile": memory.get("profile", "default"),
+            "metadata": memory.get("metadata") or {},
+            "source": memory.get("source"),
+            "tags": memory.get("tags") or [],
+            # Provide explicit defaults so a fresh INSERT (no conflict) satisfies
+            # the NOT NULL DEFAULT 0.5 constraint even if PostgREST does not apply
+            # column defaults for absent keys on older versions.
+            "importance": memory.get("importance", 0.5),
+            "surprise": memory.get("surprise", 0.5),
+        }
+        embedding = memory.get("embedding")
+        if embedding is not None:
+            row["embedding"] = str(embedding)
+        # PostgREST upsert: Prefer header must include resolution=merge-duplicates
+        # to trigger ON CONFLICT (id) DO UPDATE on the server side.
+        import warnings
+
+        from postgrest import ReturnMethod
+
+        client = self._get_client()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            result = (
+                client.from_("memories")
+                .upsert(row, returning=ReturnMethod.representation)
+                .execute()
+            )
+        if not result.data:
+            raise RuntimeError(
+                "Upsert returned no data — check Supabase connection and table permissions"
+            )
+        return _rows(result.data)[0]
+
     @with_retry(max_attempts=2, base_delay=0.3)
     def search_memories(
         self,
@@ -696,6 +741,32 @@ class SupabaseBackend:
         result = self._get_client().rpc("wiki_lint_contradictions", params).execute()
         count, sample = self._split_count_sample(_rows(result.data))
         return {"count": count, "sample": sample}
+
+    def gap_out_of_result_contradictions(
+        self, profile: str, memory_ids: list[str], *, sample_size: int = 10
+    ) -> dict[str, Any]:
+        """Contradiction edges with one endpoint in memory_ids, the other outside it.
+
+        Returns {"count": int, "pairs": [{"in_result_id": .., "other_id": .., "strength": ..}]}.
+        """
+        params: dict[str, Any] = {
+            "p_profile": profile,
+            "p_memory_ids": [str(m) for m in memory_ids],
+            "p_sample_size": sample_size,
+        }
+        result = self._get_client().rpc("gap_contradictions_for_ids", params).execute()
+        rows = _rows(result.data)
+        return {
+            "count": rows[0]["total_count"] if rows else 0,
+            "pairs": [
+                {
+                    "in_result_id": r["in_result_id"],
+                    "other_id": r["other_id"],
+                    "strength": r["strength"],
+                }
+                for r in rows
+            ],
+        }
 
     @with_retry(max_attempts=2, base_delay=0.3)
     def wiki_lint_orphans(

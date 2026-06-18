@@ -75,6 +75,32 @@ class GatewayBackend:
         # Batch via individual stores for now
         return [self._post("/api/v1/memories", row) for row in rows]
 
+    def upsert_memory(self, memory: dict[str, Any]) -> dict[str, Any]:
+        """INSERT or UPDATE a memory by id for OKF round-trip imports.
+
+        The gateway has no native upsert endpoint, so this is a GET-then-PUT
+        (update if exists) or POST (insert if not). The gateway handles
+        embedding server-side, so the embedding field in ``memory`` is ignored.
+        access_count / last_accessed_at / created_at are preserved by the gateway
+        when updating because the PUT payload only includes content/tags/metadata/source.
+        """
+        memory_id: str = memory["id"]
+        profile = memory.get("profile", "default")
+        existing = self.get_memory_by_id(memory_id, profile)
+        update_payload = {
+            "content": memory.get("content", ""),
+            "tags": memory.get("tags") or [],
+            "metadata": memory.get("metadata") or {},
+            "source": memory.get("source"),
+            "profile": profile,
+        }
+        if existing is not None:
+            return self._put(f"/api/v1/memories/{memory_id}", update_payload)
+        return self._post(
+            "/api/v1/memories",
+            {"id": memory_id, **update_payload},
+        )
+
     def get_memory_by_id(self, memory_id: str, profile: str) -> dict[str, Any] | None:
         try:
             return self._get(f"/api/v1/memories/{memory_id}", {"profile": profile})
@@ -346,6 +372,12 @@ class GatewayBackend:
     def wiki_lint_contradictions(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self._wiki_unsupported("wiki_lint_contradictions")
         return {"count": 0, "sample": []}
+
+    def gap_out_of_result_contradictions(
+        self, profile: str, memory_ids: list[str], *, sample_size: int = 10
+    ) -> dict[str, Any]:
+        # v1: gap deep-lookup not offered over the gateway. Degrade to empty.
+        return {"count": 0, "pairs": []}
 
     def wiki_lint_orphans(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self._wiki_unsupported("wiki_lint_orphans")

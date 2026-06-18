@@ -117,6 +117,11 @@ def store_memories_batch(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return get_backend().store_memories_batch(rows)
 
 
+def upsert_memory(memory: dict[str, Any]) -> dict[str, Any]:
+    """INSERT or UPDATE a memory keyed by ``id``. Delegates to the active backend."""
+    return get_backend().upsert_memory(memory)
+
+
 def search_memories(
     query_embedding: list[float],
     profile: str,
@@ -347,6 +352,19 @@ def get_related_memories(
 ) -> list[dict[str, Any]]:
     return get_backend().get_related_memories(
         memory_id, depth, min_strength, relationship_types, limit
+    )
+
+
+def gap_out_of_result_contradictions(
+    profile: str, memory_ids: list[str], *, sample_size: int = 10
+) -> dict[str, Any]:
+    """Contradiction edges where one endpoint is in memory_ids and the other is outside it.
+
+    Returns {"count": int, "pairs": [{"in_result_id": .., "other_id": .., "strength": ..}]}.
+    Dispatches to gap_contradictions_for_ids SQL function (migration 039).
+    """
+    return cast(Any, get_backend()).gap_out_of_result_contradictions(
+        profile, memory_ids, sample_size=sample_size
     )
 
 

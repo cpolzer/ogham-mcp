@@ -111,9 +111,7 @@ def test_calculate_embedding_cost_returns_none_for_unknown_and_gemini_models():
 
     assert calculate_embedding_cost({"model": "voyage:voyage-unknown", "input_tokens": 100}) is None
     assert (
-        calculate_embedding_cost(
-            {"model": "gemini:gemini-embedding-2-preview", "input_tokens": 100}
-        )
+        calculate_embedding_cost({"model": "gemini:gemini-embedding-2", "input_tokens": 100})
         is None
     )
     assert calculate_embedding_cost({"model": "ollama:embeddinggemma"}) == 0.0

@@ -19,8 +19,12 @@ from pathlib import Path
 
 import pytest
 
-MIG_028 = Path(__file__).parent.parent / "sql/migrations/028_topic_summaries.sql"
-MIG_038 = Path(__file__).parent.parent / "sql/migrations/038_data_api_grants.sql"
+MIGRATIONS_DIR = Path(__file__).parent.parent / "sql/migrations"
+MIG_025 = MIGRATIONS_DIR / "025_memory_lifecycle.sql"
+MIG_026 = MIGRATIONS_DIR / "026_memory_lifecycle_split.sql"
+MIG_028 = MIGRATIONS_DIR / "028_topic_summaries.sql"
+MIG_036 = MIGRATIONS_DIR / "036_entities_backfill.sql"
+MIG_038 = MIGRATIONS_DIR / "038_data_api_grants.sql"
 ROLLBACK_038 = (
     Path(__file__).parent.parent / "sql/migrations/rollback/DANGER_038_data_api_grants.sql"
 )
@@ -101,12 +105,23 @@ def _privileges_for(backend, role: str) -> set[tuple[str, str]]:
 
 
 def _apply_baseline(pg_fresh_db):
-    """Bring the scratch DB to the post-028 state. The autouse session
-    fixture loads schema_postgres.sql, which gives us the 7 base tables.
-    Migration 028 adds topic_summaries + topic_summary_sources -- the
-    last two tables that migration 038 grants on.
+    """Bring the scratch DB to the state migration 038 grants on: all 9
+    Ogham tables present.
+
+    The autouse session fixture loads schema_postgres.sql (memories,
+    profile_settings, memory_relationships, audit_log, entities,
+    memory_entities) and applies 025+026 once. But the pg_fresh_db
+    teardown drops memory_lifecycle, entities, memory_entities and the
+    memories.stage column, so by the time 038's tests run after any other
+    pg_fresh_db test in the session those four GRANT targets are gone and
+    a 038 GRANT raises UndefinedTable. Re-apply the migrations that create
+    them. All four are idempotent (IF NOT EXISTS / CREATE OR REPLACE), so
+    re-running on an intact DB is a no-op.
     """
-    pg_fresh_db.apply_sql(MIG_028)
+    pg_fresh_db.apply_sql(MIG_025)  # memories.stage + profile_settings decay cols
+    pg_fresh_db.apply_sql(MIG_026)  # memory_lifecycle table + triggers
+    pg_fresh_db.apply_sql(MIG_036)  # entities + memory_entities
+    pg_fresh_db.apply_sql(MIG_028)  # topic_summaries + topic_summary_sources
 
 
 def test_038_applies_cleanly_without_service_role(pg_fresh_db):

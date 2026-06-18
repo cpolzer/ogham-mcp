@@ -4,6 +4,102 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.15.0] - 2026-06-18 -- Open Knowledge Format + offline bundle viewer
+
+### Added
+
+- **Open Knowledge Format (OKF) v0.1 round-trip.** Ogham can now export
+  memories as OKF v0.1 conformant bundles (markdown documents with YAML
+  frontmatter, per the
+  [Google Cloud spec](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md))
+  and import OKF bundles back. Round-trip preserves UUID, content, tags,
+  source, and any extension metadata; embeddings are regenerated on import
+  by design. The v0.12 Obsidian export (`--format markdown`) is unchanged
+  and continues to ship alongside OKF.
+
+  - `ogham export --format okf` writes a bundle directory to the working
+    directory.
+  - `ogham import <dir>` auto-detects OKF bundles via the bundle-root
+    `index.md` declaring `okf_version`. Without that file the directory
+    is rejected, preventing accidental ingest of arbitrary paths.
+  - Concepts missing the optional `id:` extension are imported as new
+    memories; the count is surfaced as `missing_id_count` in the import
+    result. Concepts that fail to parse are surfaced as `skipped_count`.
+  - See `docs/okf-format.md` for the full round-trip contract, filename
+    scheme, and type-tag mapping rules.
+
+- **OKF bundle viewer.** Every OKF export writes a self-contained
+  `viewer.html` at the bundle root by default. Open it with any browser
+  via `file://` -- no server, no internet, no CDN required. The page
+  renders the bundle as a Cytoscape.js concept graph: each memory is a
+  node coloured by type, edges follow markdown links between concepts,
+  clicking a node shows its body and tags in a side panel. Opt out with
+  `include_viewer=false`. Cytoscape.js 3.34.0 is vendored inside the
+  wheel (MIT-licensed; see `docs/snapshots/cytoscape-js/NOTICE.md`).
+
+- **`gap_contradictions_for_ids` RPC (#262, migration 039).** New
+  read-only Postgres function used by gap-analysis queries to surface
+  `contradicts` edges where one endpoint is inside a result set and the
+  other is in the same profile but outside it. Pure addition; no
+  existing tables or RPCs touched.
+
+### Changed
+
+- **Default `gemini_embed_model` flipped to `gemini-embedding-2`.**
+  Previously `gemini-embedding-2-preview`. Both names point at the same
+  GA model on Google's API; `-preview` is a legacy alias slated for
+  retirement. Existing deployments overriding the setting are
+  unaffected. `embedding_pricing.yaml` lists both entries with the
+  preview marked as legacy.
+
+- **`wiki_lint_contradictions` filter hardened (migration 040).** The
+  function shipped in v0.12 (migration 031) joined only the source side
+  of each contradiction edge to `memories` and filtered profile on that
+  side alone. In normal operation Ogham's auto-linker only creates
+  within-profile edges, so realistic counts are unchanged; this change
+  hardens the filter so cross-profile edges are not over-counted and
+  edges whose source has moved profile are not under-counted. Forward
+  migration replaces the function via `CREATE OR REPLACE`; rollback is
+  guarded.
+
+- **Dependency floors bumped.** `fastmcp>=3.4.2,<4`, `typer>=0.24`.
+  Within-major bumps only; `google-genai`, `mistralai`, and `voyageai`
+  majors are deferred to a separate refresh release.
+
+### Fixed
+
+- **Gemini batch embedding silent truncation (#60).** Gemini's
+  `batchEmbedContents` endpoint occasionally returns HTTP 200 with
+  fewer embeddings than items submitted. Before this fix the short
+  response was silently zipped against the request batch, leaving
+  `None` slots that raised `Embedding batch completed with missing
+  results` at the end of the batch with no retry. The batch path now
+  raises immediately when `len(response.embeddings) != len(texts)`,
+  and the tenacity retry decorator fires on it the same way it fires
+  on 429 / RESOURCE_EXHAUSTED / 503 / UNAVAILABLE.
+
+### Migrations
+
+- **039_gap_contradictions_scoped.sql** -- new `gap_contradictions_for_ids`
+  RPC for gap-analysis. Idempotent (`CREATE OR REPLACE FUNCTION`).
+- **040_fix_lint_contradiction_filter.sql** -- replaces
+  `wiki_lint_contradictions` with a both-endpoint scoped definition.
+  Idempotent.
+
+Apply both via the Supabase SQL Editor or your usual migration path.
+Self-hosters on plain Postgres can apply them directly with `psql`.
+Both have `DANGER_*` rollback files in `sql/migrations/rollback/` with
+the standard `ogham.confirm_rollback = 'I-KNOW-WHAT-I-AM-DOING'`
+session-variable guard.
+
+### Build
+
+- The sdist now includes the `shared/` cross-stack data tree so the
+  `src/ogham/hooks_config.yaml` symlink resolves when `pip install`
+  extracts the tarball and builds the wheel from sdist. Without this,
+  the build failed with `FileNotFoundError`. Same class of fix as
+  v0.14 onwards for the Docker build context.
+
 ## [0.14.3] - 2026-05-25 -- Supabase Data API explicit grants
 
 ### Added

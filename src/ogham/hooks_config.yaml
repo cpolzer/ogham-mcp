@@ -1,6 +1,12 @@
 # Ogham Hooks Configuration
 # Signal filtering and secret masking patterns.
-# Edit this file to customise what gets captured and masked.
+#
+# CANONICAL SOURCE -- both ogham-mcp (Python) and ogham-cli (Go)
+# consume this file. Edit here only; consumer-side copies are
+# vendored and SHA-locked against the shared-data-vX.Y.Z tag.
+# See shared/README.md for the consumption contract and
+# shared/schema.yaml for the regex dialect lock (RE2).
+#
 # Changes take effect on next hook invocation (no restart needed).
 
 # --- Signal filtering (verb-only, multilingual) ---
@@ -11,11 +17,6 @@
 # "signal" when it was really just routine. These lists now reflect
 # events that HAPPENED (past-tense verbs + explicit annotation markers)
 # rather than topics that were MENTIONED.
-#
-# Multilingual coverage mirrors the 18-lang extraction YAMLs in
-# ogham-cli/internal/native/extraction/languages/*.yaml -- keep these
-# lists in sync when adding languages. Long-term: have hooks read those
-# YAMLs directly instead of duplicating here.
 
 signals:
   errors:
