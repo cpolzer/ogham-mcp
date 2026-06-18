@@ -19,6 +19,7 @@
 - [MCP tools](#mcp-tools) -- memory, search, graph, profiles, import/export
 - [Wiki layer](#wiki-layer) -- synthesize topics, walk the graph, lint health
 - [Obsidian export](#obsidian-export) -- snapshot your wiki to a vault of plain markdown
+- [Open Knowledge Format](#open-knowledge-format) -- portable round-trip bundles with offline graph viewer
 - [Skills](#skills) -- ogham-research, ogham-recall, ogham-maintain
 - [Scoring and condensing](#scoring-and-condensing)
 - [Cross-encoder reranking](#cross-encoder-reranking) -- optional FlashRank for self-hosters
@@ -224,8 +225,11 @@ ogham delete <id>               # Delete a memory by ID
 ogham use <profile>             # Switch default profile
 ogham profiles                  # List profiles and counts
 ogham stats                     # Profile statistics
-ogham export -o backup.json     # Export memories
-ogham import backup.json        # Import memories
+ogham export -o backup.json     # Export memories (JSON)
+ogham export --format markdown  # Export as Obsidian-compatible markdown
+ogham export --format okf       # Export as Open Knowledge Format v0.1 bundle
+ogham import backup.json        # Import a JSON export
+ogham import <okf-bundle-dir>   # Import an OKF bundle directory (auto-detected)
 ogham cleanup                   # Remove expired memories
 ogham hooks install             # Auto-detect client + configure hooks
 ogham hooks recall              # Read from the stone (load project context)
@@ -412,8 +416,10 @@ Admin operations such as config, health, stats, audit, export, delete, and clean
 
 | Tool | Description | Key parameters |
 |------|-------------|----------------|
-| `export_profile` | Export all memories in active profile | `format` (`json` or `markdown`) |
-| `import_memories_tool` | Import memories with deduplication | `data`, `dedup_threshold` |
+| `export_profile` | Export all memories in active profile | `format` (`json`, `markdown`, or `okf`), `include_viewer` (default true for OKF) |
+| `import_memories_tool` | Import a JSON export string OR auto-detect an OKF bundle directory by path | `data`, `dedup_threshold` |
+
+**`--format okf`** writes an [Open Knowledge Format v0.1](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing) conformant bundle: a directory of one-markdown-file-per-memory with YAML frontmatter, a bundle-root `index.md` declaring `okf_version: "0.1"`, and a self-contained `viewer.html` (Cytoscape.js graph, opens with `file://`, no server or CDN needed). Round-trip preserves UUID, content, tags, source, and metadata; the embedding is regenerated on import. Pass `include_viewer=false` to skip the HTML graph. See [docs/okf-format.md](docs/okf-format.md) for the round-trip contract.
 
 ### Maintenance
 
@@ -458,6 +464,41 @@ ogham export-obsidian /path/to/vault --profile work --force
 The export is read-only -- it writes files but never reads them back. Edits in Obsidian stay in Obsidian; re-run the export to refresh the snapshot. By design the exporter refuses to write into a directory that already contains files it didn't create; pass `--force` to override that guardrail.
 
 Full guide with frontmatter reference, troubleshooting, and screenshots: [obsidian export docs](https://ogham-mcp.dev/docs/obsidian-export/).
+
+## Open Knowledge Format
+
+Round-trip portability for your memories. Ogham reads and writes [Open Knowledge Format (OKF) v0.1](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing), the markdown-based interchange format Google Cloud published in June 2026. The same bundle is portable to any other OKF-speaking tool -- Google's Knowledge Catalog, a colleague's homegrown reader, or your own future system.
+
+```bash
+# Export your profile as an OKF v0.1 bundle directory
+ogham export --format okf
+
+# Round-trip it back (auto-detected as an OKF bundle)
+ogham import ogham-okf-<profile>-<timestamp>
+```
+
+The bundle is a directory tree:
+
+```
+ogham-okf-<profile>-<timestamp>/
+├── index.md                     # declares okf_version: "0.1"
+├── viewer.html                  # self-contained Cytoscape.js graph (opens with file://)
+└── memories/
+    ├── <slug>-<uuid8>.md        # one markdown file per memory
+    └── ...
+```
+
+Each memory file has YAML frontmatter (`type`, `id`, `tags`, `timestamp`, `source`, optional `title`) and the memory body as markdown. `type:` is derived from the first `type:X` tag alphabetically (falling back to `Memory`). Round-trip preserves UUID, content, tags, source, and any extension metadata; the embedding is regenerated on import.
+
+The `viewer.html` is a 425 KB self-contained file with [Cytoscape.js](https://github.com/cytoscape/cytoscape.js) (MIT) vendored inline -- no server, no internet, no CDN. Open it in any browser via `file://` to see your memories as a graph coloured by type, with edges following intra-bundle markdown links. Pass `include_viewer=false` to skip it.
+
+Import behaviour:
+
+- Memories with the `id:` extension upsert by UUID (idempotent re-imports).
+- Memories without `id:` insert as new; the count surfaces as `missing_id_count` in the result.
+- The importer requires a bundle-root `index.md` with `okf_version` declared so pointing it at a random directory fails fast.
+
+User-facing docs: [docs/okf-format.md](docs/okf-format.md).
 
 ## Importing existing memory
 
