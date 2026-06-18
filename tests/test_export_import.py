@@ -451,3 +451,42 @@ def test_build_row_does_not_carry_created_at_for_compaction_safety():
     )
     # Sanity: the historical date is preserved where it should be -- in metadata.
     assert row["metadata"]["claude_created_at"] == "2024-09-13T09:13:28Z"
+
+
+def test_looks_like_okf_bundle_dir_swallows_oserror():
+    # On Linux, Path(long_json_str).is_dir() raises OSError(36, ENAMETOOLONG)
+    # when any path component exceeds NAME_MAX (255 bytes). The helper must
+    # swallow that and return False so import_memories falls through to the
+    # JSON branch. Regression for v0.15.2.
+    from ogham.export_import import _looks_like_okf_bundle_dir
+
+    with patch("ogham.export_import.Path") as mock_path:
+        mock_path.return_value.is_dir.side_effect = OSError(36, "File name too long")
+        assert _looks_like_okf_bundle_dir("{...long JSON...}") is False
+
+
+def test_import_memories_does_not_raise_on_linux_enametoolong():
+    # End-to-end regression: import_memories with a long JSON payload must not
+    # raise OSError when the underlying Path.is_dir() call would fail with
+    # ENAMETOOLONG on Linux. v0.15.0 + v0.15.1 PyPI wheels were broken for
+    # any non-trivial Linux import because the bare Path(data).is_dir() check
+    # raised before json.loads could see the payload.
+    from ogham.export_import import import_memories
+
+    export_data = json.dumps({"profile": "default", "memories": FAKE_MEMORIES})
+
+    with (
+        patch("ogham.export_import.Path") as mock_path,
+        patch("ogham.export_import.generate_embeddings_batch") as mock_embed,
+        patch("ogham.export_import.store_memories_batch") as mock_store,
+        patch("ogham.export_import.get_profile_ttl") as mock_ttl,
+    ):
+        mock_path.return_value.is_dir.side_effect = OSError(36, "File name too long")
+        mock_embed.return_value = [[0.1] * 768] * 2
+        mock_store.return_value = [{"id": "new-id"}] * 2
+        mock_ttl.return_value = None
+
+        result = import_memories(export_data, "default")
+
+    # Did not raise -- and parsed the JSON correctly.
+    assert result["imported"] == 2

@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.15.2] - 2026-06-18 -- Linux import ENAMETOOLONG hotfix
+
+### Fixed
+
+- **`import_memories_tool` crashed on Linux with `OSError: [Errno 36]
+  File name too long`** for any non-trivial JSON payload. The OKF
+  directory-detection logic added in v0.15.0 called
+  `Path(data).is_dir()` on the raw input string. On Linux, `pathlib`
+  raises `OSError` when any path component exceeds `NAME_MAX` (255 bytes),
+  which is every realistic export payload. macOS silently returns `False`,
+  so local dev never caught it -- but Linux users hit `OSError` on any
+  call to `import_memories_tool` larger than a trivial test fixture. Fix:
+  wrap the `is_dir()` call in a try/except that swallows `OSError` and
+  returns `False`, so the function falls through to the JSON branch as
+  intended. Two regression tests pin the helper and the end-to-end path
+  against simulated `ENAMETOOLONG`. PyPI 0.15.0 and 0.15.1 are both
+  affected; upgrade to 0.15.2 if you import on Linux.
+
 ## [0.15.1] - 2026-06-18 -- Supabase OKF round-trip hotfix
 
 ### Fixed

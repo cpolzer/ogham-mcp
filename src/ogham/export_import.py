@@ -148,6 +148,17 @@ def _upsert_memory(memory: dict[str, Any]) -> None:
     _db_upsert(memory)
 
 
+def _looks_like_okf_bundle_dir(data: str) -> bool:
+    # Path.is_dir() raises OSError(36, "File name too long") on Linux when any
+    # path component exceeds NAME_MAX (255 bytes) -- which happens whenever
+    # `data` is a JSON payload mistakenly passed where a path is expected.
+    # macOS silently returns False, so this bug only surfaces on Linux CI / prod.
+    try:
+        return Path(data).is_dir()
+    except OSError:
+        return False
+
+
 def import_memories(
     data: str,
     profile: str,
@@ -170,7 +181,7 @@ def import_memories(
         on_embed_progress: Optional callback(embedded, total) called after each batch.
     """
     # ── OKF bundle path ────────────────────────────────────────────────
-    if isinstance(data, str) and Path(data).is_dir():
+    if isinstance(data, str) and _looks_like_okf_bundle_dir(data):
         # Pre-flight: confirm this is actually an OKF bundle (has index.md declaring
         # okf_version), not just any directory the user pointed at by accident.
         bundle_dir = Path(data)
