@@ -65,7 +65,9 @@ class Settings(BaseSettings):
 
     mistral_embed_model: str = "mistral-embed"
     voyage_embed_model: str = "voyage-4-lite"
-    gemini_embed_model: str = "gemini-embedding-2-preview"
+    gemini_embed_model: str = "gemini-embedding-2"
+
+    onnx_model_path: str = ""
 
     default_match_threshold: float = 0.7
     default_match_count: int = 10
@@ -75,7 +77,11 @@ class Settings(BaseSettings):
     ollama_timeout: int = 60
     embedding_batch_size: int | None = None
 
-    embedding_cache_max_size: int = 10000
+    # Persistent SQLite embedding cache at ~/.cache/ogham/embeddings.db by
+    # default. 100K entries covers normal daily use (~300 MB at 768 dim).
+    # For a full 500q LongMemEval clean-re-run (~260K memories), bump to
+    # 500000 via EMBEDDING_CACHE_MAX_SIZE so the second run is cache-hit.
+    embedding_cache_max_size: int = 100000
     embedding_cache_dir: str | None = None
 
     # Temporal LLM fallback: model for resolving complex date expressions.
@@ -83,6 +89,46 @@ class Settings(BaseSettings):
     # (e.g. "llama3.2") for local LLM, or "gpt-4o-mini" for OpenAI, or any
     # litellm-compatible model string. Requires litellm installed.
     temporal_llm_model: str = ""
+
+    rerank_enabled: bool = False
+    rerank_model: str = "flashrank"  # "flashrank" or "bge"
+    rerank_alpha: float = 0.55
+
+    # Gap-analysis (task #262). stale_days mirrors wiki_lint._DEFAULT_STABLE_DAYS.
+    gap_stale_days: int = 90
+    gap_confidence_floor: float = 0.5
+    # Empty = reuse the wiki/recompute synthesis provider+model for prose narration.
+    gap_synthesis_provider: str = ""
+    gap_synthesis_model: str = ""
+
+    # Wiki Tier 1 (v0.12.1) -- prepend top-K matching topic_summaries to
+    # the MCP `hybrid_search` tool's results as a context-injection layer.
+    # Default True since v0.12.1: the injection happens at the tool layer
+    # (tools/memory.py::hybrid_search), not in service.search_memories_enriched,
+    # so benchmarks calling the service directly never see preamble
+    # pollution. MCP clients (Claude / Cursor / OpenCode) get the
+    # synthesized topic context as preamble before raw memories.
+    wiki_injection_enabled: bool = True
+    wiki_injection_top_k: int = 3
+    wiki_injection_min_similarity: float = 0.4
+
+    # Hard cap on source-memory count for compile_wiki. Mega-rollup tags
+    # (e.g. "type:gotcha", "project:foo") accumulate hundreds of memories
+    # over time; synthesizing all of them into one ~1500-word page produces
+    # very large LLM outputs that fail JSON escaping reliability and saturate
+    # context budgets without producing a coherent page. Surfaced 2026-04-29
+    # by Hotfix C: project:ogham (687 mem, 1.4M char prompt) consistently
+    # failed even on Gemini 2.5 Pro. Above this cap, compile_wiki refuses
+    # by default; pass `force_oversize=True` to override for one-off intent.
+    # 0 disables the check.
+    compile_max_sources: int = 100
+
+    # Locale for wiki-layer prompt templates and user-facing messages.
+    # Two-letter language code matching a file under src/ogham/data/languages/
+    # (en, de, fr, ja, ...). Falls back to English when a key is missing
+    # in the requested locale, so partial localisations don't break the
+    # compile pipeline.
+    locale: str = "en"
 
     bare_postgrest: bool = False
 
@@ -92,6 +138,9 @@ class Settings(BaseSettings):
     server_transport: str = Field(default="stdio", validation_alias="OGHAM_TRANSPORT")
     server_host: str = Field(default="127.0.0.1", validation_alias="OGHAM_HOST")
     server_port: int = Field(default=8742, validation_alias="OGHAM_PORT")
+
+    recall_enabled: bool = Field(default=True, validation_alias="OGHAM_RECALL_ENABLED")
+    inscribe_enabled: bool = Field(default=True, validation_alias="OGHAM_INSCRIBE_ENABLED")
 
     gateway_url: str = Field(default="", validation_alias="OGHAM_GATEWAY_URL")
     gateway_api_key: str = Field(default="", validation_alias="OGHAM_API_KEY")
@@ -107,7 +156,7 @@ class Settings(BaseSettings):
     @field_validator("embedding_provider")
     @classmethod
     def check_provider(cls, v: str) -> str:
-        allowed = {"ollama", "openai", "mistral", "voyage", "gemini"}
+        allowed = {"ollama", "openai", "mistral", "voyage", "gemini", "onnx"}
         if v not in allowed:
             raise ValueError(f"embedding_provider must be one of {allowed}, got {v!r}")
         return v
@@ -122,15 +171,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_config(self) -> "Settings":
-        """Set provider-aware defaults and validate backend config."""
+        """Set provider-aware defaults.
+
+        Backend credential validation happens at backend/client initialization
+        time so modules can inspect default settings without requiring a fully
+        configured runtime environment.
+        """
         if self.embedding_dim is None:
             self.embedding_dim = PROVIDER_DEFAULT_DIMS.get(self.embedding_provider, 1024)
         if self.embedding_batch_size is None:
             self.embedding_batch_size = PROVIDER_BATCH_DEFAULTS.get(self.embedding_provider, 50)
-        if self.database_backend == "supabase" and not self.supabase_url:
-            raise ValueError("SUPABASE_URL is required when DATABASE_BACKEND=supabase")
-        if self.database_backend == "postgres" and not self.database_url:
-            raise ValueError("DATABASE_URL is required when DATABASE_BACKEND=postgres")
         return self
 
 

@@ -16,7 +16,7 @@
 #   - uv for Python builds
 #   - psycopg installed (for migrations)
 
-.PHONY: test lint build publish tag clean wheel sync gateway migrate release release-patch check-clean version-check smoke preflight
+.PHONY: test test-postgres-db test-postgres test-external lint build publish tag clean wheel sync gateway migrate release release-patch check-clean version-check smoke preflight
 
 # --- Paths ---
 DEV_REPO := /Users/kevinburns/Developer/web-projects/openbrain-sharedmemory
@@ -25,14 +25,26 @@ GATEWAY_REPO := /Users/kevinburns/Developer/web-projects/ogham-gateway
 
 # --- Core targets ---
 
-# Run all tests
+# Run the standard local suite. External Supabase/Ollama tests are opt-in.
 test:
 	uv run pytest tests/ -v
+
+test-postgres-db:
+	docker compose --profile test up -d postgres-scratch
+
+test-postgres: test-postgres-db
+	DATABASE_BACKEND=postgres \
+	DATABASE_URL=postgresql://ogham:ogham@localhost:5433/ogham_scratch \
+	uv run pytest -m postgres_integration
+
+test-external:
+	OGHAM_RUN_EXTERNAL_INTEGRATION=1 uv run pytest -m integration -v
 
 # Lint + format check
 lint:
 	uv run ruff check src/ tests/
 	uv run ruff format --check src/ tests/
+	uv run pyright
 
 # Clean build artifacts
 clean:
@@ -44,12 +56,23 @@ build: clean
 
 # --- Sync dev → public repo ---
 
-# Files to sync from dev to public
+# Files to sync from dev to public.
+#
+# v0.13.1 audit found 8 release-critical files were silently skipped by
+# this list (lifecycle.py + graph.py + tools/memory.py + new tests +
+# docs/internals/hooks.md). Adding them explicitly + globbing migrations
+# closes the v0.9.2 / v0.13.0 sync-gap class of bugs once and for all.
+#
+# Migrations are now globbed at sync time (see the sync target). Schemas
+# stay individually listed because they're hand-curated and we want the
+# explicit dev → public mapping visible at review time.
 SYNC_SOURCES := \
 	src/ogham/hooks.py \
 	src/ogham/hooks_cli.py \
 	src/ogham/hooks_install.py \
 	src/ogham/hooks_config.yaml \
+	src/ogham/lifecycle.py \
+	src/ogham/graph.py \
 	src/ogham/service.py \
 	src/ogham/database.py \
 	src/ogham/config.py \
@@ -62,9 +85,15 @@ SYNC_SOURCES := \
 	src/ogham/backends/postgres.py \
 	src/ogham/backends/supabase.py \
 	src/ogham/backends/gateway.py \
+	src/ogham/tools/memory.py \
+	src/ogham/tools/wiki.py \
+	src/ogham/tools/stats.py \
 	tests/test_hooks.py \
+	tests/test_hooks_cli.py \
 	tests/test_extraction.py \
 	tests/test_backend_wiring.py \
+	tests/test_supabase_lifecycle_graph_parity.py \
+	docs/internals/hooks.md \
 	sql/schema.sql \
 	sql/schema_postgres.sql \
 	sql/schema_selfhost_supabase.sql \
@@ -80,14 +109,96 @@ sync:
 			cp "$(DEV_REPO)/$$f" "$(PUB_REPO)/$$f"; \
 		fi; \
 	done
-	@echo "Synced $$(echo $(SYNC_SOURCES) | wc -w | tr -d ' ') files"
+	@echo "Synced $$(echo $(SYNC_SOURCES) | wc -w | tr -d ' ') tracked files"
+	@echo ""
+	@echo "--- Syncing sql/migrations/ (additive; never deletes public-only files) ---"
+	@mkdir -p "$(PUB_REPO)/sql/migrations"
+	@MIG_COUNT=0; for f in $(DEV_REPO)/sql/migrations/[0-9]*.sql; do \
+		if [ -f "$$f" ]; then \
+			cp "$$f" "$(PUB_REPO)/sql/migrations/" && MIG_COUNT=$$((MIG_COUNT+1)); \
+		fi; \
+	done; echo "Synced $$MIG_COUNT migration files"
+	@mkdir -p "$(PUB_REPO)/sql/migrations/rollback"
+	@RB_COUNT=0; for f in $(DEV_REPO)/sql/migrations/rollback/*.sql; do \
+		if [ -f "$$f" ]; then \
+			cp "$$f" "$(PUB_REPO)/sql/migrations/rollback/" && RB_COUNT=$$((RB_COUNT+1)); \
+		fi; \
+	done; echo "Synced $$RB_COUNT rollback files"
 	@echo ""
 	@echo "--- Changes in public repo ---"
 	@cd $(PUB_REPO) && git diff --stat HEAD
 
 # --- Publish to PyPI ---
 
-publish: build
+publish-check:
+	@echo "=== Publish-check: scanning dist/ for secrets ==="
+	@if [ ! -d dist ] || [ -z "$$(ls dist/*.tar.gz 2>/dev/null)" ]; then \
+		echo "  ✗ No sdist in dist/ -- run 'make build' first"; exit 1; fi
+	@TMPDIR=$$(mktemp -d); \
+	SDIST=$$(ls -t dist/*.tar.gz 2>/dev/null | head -1); \
+	echo "  Scanning: $$SDIST"; \
+	tar -xzf "$$SDIST" -C "$$TMPDIR"; \
+	HITS=$$(grep -rIE 'sk_(test|live)_[a-zA-Z0-9]{12,}|pk_(test|live)_[a-zA-Z0-9]{12,}|sbp_[a-zA-Z0-9]{20,}|sb_(secret|publishable)_[a-zA-Z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}|ghp_[a-zA-Z0-9]{30,}|npg_[a-zA-Z0-9]{10,}|postgres(ql)?://[^:@[:space:]]+:[^@[:space:]]+@[^[:space:]/]+' "$$TMPDIR" 2>/dev/null | grep -vE "\.env\.example|user:pass|your_|YOUR_|<password>|REPLACE_|example\.com|@localhost|@127\.0\.0\.1|ABCDEFghij|ogham_test|s3cretP4ss" || true); \
+	rm -rf "$$TMPDIR"; \
+	if [ -n "$$HITS" ]; then \
+		echo ""; \
+		echo "❌ Publish blocked: credential-like strings detected in sdist:"; \
+		echo "$$HITS" | head -10 | sed 's/^/    /'; \
+		echo ""; \
+		echo "   History: v0.10.x series accidentally shipped Neon postgres URLs"; \
+		echo "   via hardcoded Makefile vars. Check Makefile / source for embedded"; \
+		echo "   creds and move them to env vars or 'op read' indirection."; \
+		exit 1; \
+	fi
+	@echo "  ✓ No credential-like strings in dist/"
+	@echo ""
+	@echo "=== Bloat-check: sdist file count + forbidden paths ==="
+	@TMPDIR=$$(mktemp -d); \
+	SDIST=$$(ls -t dist/*.tar.gz 2>/dev/null | head -1); \
+	tar -xzf "$$SDIST" -C "$$TMPDIR"; \
+	ROOT=$$(ls -d "$$TMPDIR"/*/ | head -1); \
+	FILE_COUNT=$$(find "$$ROOT" -type f | wc -l | tr -d ' '); \
+	echo "  Files in sdist: $$FILE_COUNT"; \
+	if [ $$FILE_COUNT -lt 100 ]; then \
+		echo "❌ Publish blocked: sdist has fewer than 100 files ($$FILE_COUNT) -- something likely got over-excluded."; \
+		rm -rf "$$TMPDIR"; exit 1; \
+	fi; \
+	if [ $$FILE_COUNT -gt 400 ]; then \
+		echo "❌ Publish blocked: sdist has more than 400 files ($$FILE_COUNT) -- bloat or unintended directory shipped."; \
+		echo "   v0.13.0 baseline was 185 files. Recent good ships: 185-200 files."; \
+		echo "   Top 20 directories by file count:"; \
+		(cd "$$ROOT" && find . -type f | sed 's|^\./||; s|/[^/]*$$||' | sort | uniq -c | sort -rn | head -20 | sed 's/^/    /'); \
+		rm -rf "$$TMPDIR"; exit 1; \
+	fi; \
+	echo "  ✓ File count in expected range (100-400)"; \
+	FORBIDDEN=$$(find "$$ROOT" -type f \( \
+		-path '*/docs/*' -o \
+		-path '*/benchmarks/*' -o \
+		-path '*/.claude/*' -o \
+		-path '*/.github/*' -o \
+		-path '*/.worktrees/*' -o \
+		-path '*/research/*' -o \
+		-path '*/extras/*' -o \
+		-path '*/notebooks/*' -o \
+		-path '*/demo-scripts/*' -o \
+		-path '*/sql/migrations/rollback/*' -o \
+		-name '*.env' -o \
+		-name '*.env.local' -o \
+		-name '*.env.*.local' -o \
+		-name 'DANGER_*.sql' -o \
+		-name 'config.toml' \
+	\) 2>/dev/null | head -20); \
+	if [ -n "$$FORBIDDEN" ]; then \
+		echo "❌ Publish blocked: forbidden paths in sdist:"; \
+		echo "$$FORBIDDEN" | sed "s|$$ROOT|    |"; \
+		echo ""; \
+		echo "   These directories should be in [tool.hatch.build.targets.sdist].exclude."; \
+		rm -rf "$$TMPDIR"; exit 1; \
+	fi; \
+	echo "  ✓ No forbidden paths (docs/, benchmarks/, .claude/, .github/, demo-scripts/, rollback/, .env*, DANGER_*.sql)"; \
+	rm -rf "$$TMPDIR"
+
+publish: build publish-check smoke
 	@echo "=== Publishing to PyPI ==="
 	uv publish --token $$(op read "op://Ogham-Gateway/PyPi - Ogham Dev token/api_key")
 	@echo ""
@@ -98,7 +209,20 @@ publish: build
 tag:
 	@VERSION=$$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"); \
 	echo "=== Creating GitHub release v$$VERSION ==="; \
-	git add -A && git commit -m "v$$VERSION" --allow-empty; \
+	BEFORE_HEAD=$$(git rev-parse HEAD); \
+	git add -A; \
+	if ! git commit -m "v$$VERSION" --allow-empty; then \
+		echo "ERROR: 'git commit --allow-empty' returned non-zero -- pre-commit hook (prek/ruff/pyright) likely blocked the commit."; \
+		echo "       Run 'git commit --allow-empty -m \"v$$VERSION\"' manually to see the hook output, fix it, then re-run 'make tag'."; \
+		exit 1; \
+	fi; \
+	AFTER_HEAD=$$(git rev-parse HEAD); \
+	if [ "$$BEFORE_HEAD" = "$$AFTER_HEAD" ]; then \
+		echo "ERROR: HEAD did not move after 'git commit --allow-empty' (was $$BEFORE_HEAD, still $$BEFORE_HEAD)."; \
+		echo "       A pre-commit hook silently aborted the commit. Tagging this HEAD would publish stale code."; \
+		echo "       This was the root cause of the v0.13.0 ship incident -- do not bypass."; \
+		exit 1; \
+	fi; \
 	git push origin main; \
 	git tag -a "v$$VERSION" -m "v$$VERSION"; \
 	git push origin "v$$VERSION"; \
@@ -147,9 +271,14 @@ gateway-push:
 
 # --- Database migrations ---
 
-NEON_US := "postgresql://neondb_owner:npg_2cSLWlVye8Dj@ep-holy-snow-ae0hur3m-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-NEON_EU := "postgresql://neondb_owner:npg_kHJsPtF4i3CR@ep-soft-grass-aln9vxgp-pooler.c-3.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-NEON_AP := "postgresql://neondb_owner:npg_qXLua6z0cRHe@ep-curly-dew-a1uok6f9-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+# Regional database URLs come from the environment -- never hardcoded.
+# Set these before running `make migrate` (e.g. via direnv / 1Password /
+# `op run --env-file=...`). This was where we used to embed live
+# credentials in earlier releases -- removed in v0.11.0 after discovering
+# the leak. See CHANGELOG v0.11.0 release notes for detail.
+NEON_US ?= $(shell op read "op://Ogham-Gateway/supabase-regional-databases/us-direct-url" 2>/dev/null)
+NEON_EU ?= $(shell op read "op://Ogham-Gateway/supabase-regional-databases/eu-direct-url" 2>/dev/null)
+NEON_AP ?= $(shell op read "op://Ogham-Gateway/supabase-regional-databases/ap-pooler-url" 2>/dev/null)
 
 migrate:
 	@echo "=== Applying migrations to all Neon databases ==="

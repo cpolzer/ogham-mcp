@@ -3,7 +3,8 @@
 Walks users through database configuration, embedding provider selection,
 schema migration, and MCP client configuration.
 
-Supports: Claude Desktop, Claude Code, Cursor, VS Code (Copilot), Codex CLI, Kiro, OpenCode.
+Supports: Claude Desktop, Claude Code, Cursor, VS Code (Copilot), Codex CLI,
+Kiro, Antigravity (Google), OpenCode.
 Platforms: macOS, Linux, Windows.
 Execution modes: uvx (default), Docker (GHCR image).
 """
@@ -14,6 +15,7 @@ import platform
 import shutil
 from importlib.metadata import version as pkg_version
 from pathlib import Path
+from typing import Any, cast
 
 from rich.console import Console
 from rich.panel import Panel
@@ -97,6 +99,12 @@ def _client_configs() -> list[dict]:
             "format": "mcp_json",
         },
         {
+            "name": "Antigravity (Google)",
+            "path": home / ".gemini" / "antigravity" / "mcp_config.json",
+            "detect": home / ".gemini" / "antigravity",
+            "format": "antigravity",
+        },
+        {
             "name": "OpenCode",
             "path": home / ".config" / "opencode" / "opencode.json",
             "detect": home / ".config" / "opencode",
@@ -169,8 +177,8 @@ def _prompt_database() -> dict:
             "   Supabase secret key (formerly service_role)",
             default=default_key or None,
         )
-        env_vars["SUPABASE_URL"] = url
-        env_vars["SUPABASE_KEY"] = key
+        env_vars["SUPABASE_URL"] = url or ""
+        env_vars["SUPABASE_KEY"] = key or ""
     else:
         console.print("\n   Great. Paste your PostgreSQL connection string.")
         console.print("   [cyan]Neon: Dashboard -> Connection Details -> Connection string[/cyan]")
@@ -183,7 +191,7 @@ def _prompt_database() -> dict:
         if default_url:
             console.print("   [cyan]Found DATABASE_URL in environment.[/cyan]")
         url = Prompt.ask("   Database URL", default=default_url or None)
-        env_vars["DATABASE_URL"] = url
+        env_vars["DATABASE_URL"] = url or ""
 
     return env_vars
 
@@ -199,13 +207,31 @@ def _prompt_embeddings() -> dict:
     console.print("   Ogham turns text into vectors for search. Which provider do you want?\n")
     console.print("   [bold]1)[/bold] ollama   -- free, runs on your machine (must be running)")
     console.print("   [bold]2)[/bold] openai   -- $0.02/1M tokens (API key required)")
-    console.print("   [bold]3)[/bold] voyage   -- $0.02/1M tokens + 200M free (API key required)")
-    console.print("   [bold]4)[/bold] mistral  -- fixed 1024 dims (API key required)\n")
+    console.print("   [bold]3)[/bold] gemini   -- free tier 1500 RPM (API key required)")
+    console.print("   [bold]4)[/bold] voyage   -- $0.02/1M tokens + 200M free (API key required)")
+    console.print("   [bold]5)[/bold] mistral  -- fixed 1024 dims (API key required)\n")
 
-    provider_map = {"1": "ollama", "2": "openai", "3": "voyage", "4": "mistral"}
+    provider_map = {
+        "1": "ollama",
+        "2": "openai",
+        "3": "gemini",
+        "4": "voyage",
+        "5": "mistral",
+    }
     choice = Prompt.ask(
         "   Choose",
-        choices=["1", "2", "3", "4", "ollama", "openai", "voyage", "mistral"],
+        choices=[
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "ollama",
+            "openai",
+            "gemini",
+            "voyage",
+            "mistral",
+        ],
         default="1",
     )
     provider = provider_map.get(choice, choice)
@@ -217,19 +243,25 @@ def _prompt_embeddings() -> dict:
         if default_key:
             console.print("   [cyan]Found OPENAI_API_KEY in environment.[/cyan]")
         key = Prompt.ask("   OpenAI API key", default=default_key or None)
-        env_vars["OPENAI_API_KEY"] = key
+        env_vars["OPENAI_API_KEY"] = key or ""
+    elif provider == "gemini":
+        default_key = os.environ.get("GEMINI_API_KEY", "")
+        if default_key:
+            console.print("   [cyan]Found GEMINI_API_KEY in environment.[/cyan]")
+        key = Prompt.ask("   Gemini API key", default=default_key or None)
+        env_vars["GEMINI_API_KEY"] = key or ""
     elif provider == "voyage":
         default_key = os.environ.get("VOYAGE_API_KEY", "")
         if default_key:
             console.print("   [cyan]Found VOYAGE_API_KEY in environment.[/cyan]")
         key = Prompt.ask("   Voyage AI API key", default=default_key or None)
-        env_vars["VOYAGE_API_KEY"] = key
+        env_vars["VOYAGE_API_KEY"] = key or ""
     elif provider == "mistral":
         default_key = os.environ.get("MISTRAL_API_KEY", "")
         if default_key:
             console.print("   [cyan]Found MISTRAL_API_KEY in environment.[/cyan]")
         key = Prompt.ask("   Mistral API key", default=default_key or None)
-        env_vars["MISTRAL_API_KEY"] = key
+        env_vars["MISTRAL_API_KEY"] = key or ""
     elif provider == "ollama":
         default_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
         url = Prompt.ask("   Ollama URL", default=default_url)
@@ -418,7 +450,7 @@ def _run_schema(env_vars: dict) -> bool:
             with console.status("   Running schema migration..."):
                 conn = psycopg.connect(db_url)
                 conn.autocommit = True
-                conn.execute(schema_sql)
+                cast(Any, conn).execute(schema_sql)
                 conn.close()
             console.print("   [green]Schema migration complete.[/green]")
             return True
@@ -498,6 +530,14 @@ def _write_mcp_config(client: dict, mcp_entry: dict):
             "environment": mcp_entry.get("env", {}),
             "enabled": True,
         }
+    elif fmt == "antigravity":
+        # Antigravity uses mcpServers but "serverUrl" instead of "url" for SSE
+        if "mcpServers" not in existing:
+            existing["mcpServers"] = {}
+        entry = dict(mcp_entry)
+        if "url" in entry:
+            entry["serverUrl"] = entry.pop("url")
+        existing["mcpServers"]["ogham"] = entry
     elif fmt == "vscode":
         # VS Code uses "servers" key inside mcp.json
         if "servers" not in existing:
@@ -562,6 +602,7 @@ def _configure_clients(
 def _test_connection(env_vars: dict) -> bool:
     """Validate database and embedding connectivity."""
     console.print("\n[bold]6. Let's check everything works[/bold]")
+    settings_obj: Any | None = None
 
     # Temporarily set env vars for the health check
     original_env = {}
@@ -573,7 +614,8 @@ def _test_connection(env_vars: dict) -> bool:
         # Force fresh settings instance from the temp env vars
         from ogham.config import settings
 
-        settings._force()
+        settings_obj = settings
+        settings_obj._force()
 
         # Check database
         with console.status("   Checking database..."):
@@ -612,7 +654,8 @@ def _test_connection(env_vars: dict) -> bool:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = original
-        settings._reset()
+        if settings_obj is not None:
+            settings_obj._reset()
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +748,7 @@ def run_init(
         if api_key:
             key_map = {
                 "openai": "OPENAI_API_KEY",
+                "gemini": "GEMINI_API_KEY",
                 "voyage": "VOYAGE_API_KEY",
                 "mistral": "MISTRAL_API_KEY",
             }

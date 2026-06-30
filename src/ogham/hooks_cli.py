@@ -56,58 +56,125 @@ def _should_recall() -> bool:
     return True
 
 
+def _event_type(data: dict) -> str:
+    raw = data.get("hook_event_name") or data.get("event") or data.get("event_name")
+    if raw:
+        return str(raw)
+    if "tool_name" in data:
+        return "PostToolUse"
+    if _prompt_from_data(data):
+        return "UserPromptSubmit"
+    return ""
+
+
+def _prompt_from_data(data: dict) -> str:
+    for key in ("prompt", "user_prompt", "message"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _echo_dry_run(result: str | None) -> None:
+    if result:
+        typer.echo(result)
+    else:
+        typer.echo("No memory would be stored.")
+
+
 @hooks_app.command(name="recall")
 def recall_cmd(
     profile: str = typer.Option("work", help="Memory profile"),
     force: bool = typer.Option(False, help="Skip debounce, always recall"),
+    recall: bool | None = typer.Option(
+        None,
+        "--recall/--no-recall",
+        help="Enable or disable recall for this hook invocation",
+    ),
 ):
     """Read from the stone. Load relevant memories for the current project."""
+    from ogham.flow_control import recall_enabled, temporary_flow_overrides
     from ogham.hooks import post_compact, session_start
 
-    # Debounce: only recall once per 30 min (Kiro fires on every prompt)
-    if not force and not _should_recall():
-        return
+    with temporary_flow_overrides(recall=recall):
+        if not recall_enabled():
+            return
 
-    data = _read_stdin()
-    cwd = data.get("cwd", ".")
+        # Debounce: only recall once per 30 min (Kiro fires on every prompt)
+        if not force and not _should_recall():
+            return
 
-    output = session_start(cwd=cwd, profile=profile)
-    if not output:
-        output = post_compact(cwd=cwd, profile=profile)
-    if output:
-        typer.echo(output)
+        data = _read_stdin()
+        cwd = data.get("cwd", ".")
+
+        output = session_start(cwd=cwd, profile=profile)
+        if not output:
+            output = post_compact(cwd=cwd, profile=profile)
+        if output:
+            typer.echo(output)
 
 
 @hooks_app.command(name="inscribe")
 def inscribe_cmd(
     profile: str = typer.Option("work", help="Memory profile"),
+    inscribe: bool | None = typer.Option(
+        None,
+        "--inscribe/--no-inscribe",
+        help="Enable or disable inscribe for this hook invocation",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview the memory that would be stored without writing it",
+    ),
 ):
     """Carve into the stone. Capture activity or drain session before compaction."""
-    from ogham.hooks import post_tool, pre_compact
+    from ogham.flow_control import inscribe_enabled, temporary_flow_overrides
+    from ogham.hooks import post_tool, pre_compact, user_prompt_submit
 
-    data = _read_stdin()
+    with temporary_flow_overrides(inscribe=inscribe):
+        if not inscribe_enabled():
+            return
 
-    if not data:
-        # Kiro Agent Stop or no stdin -- create a minimal marker
-        import os
+        data = _read_stdin()
 
-        data = {
-            "tool_name": "AgentStop",
-            "tool_input": {"summary": "Agent turn completed"},
-            "cwd": os.getcwd(),
-            "session_id": "kiro",
-        }
+        if not data:
+            # Kiro Agent Stop or no stdin -- create a minimal marker
+            import os
 
-    # If it looks like a tool call, capture as post_tool
-    if "tool_name" in data:
-        post_tool(data, profile=profile)
-    else:
-        # Otherwise treat as compaction drain
-        pre_compact(
-            session_id=data.get("session_id", "unknown"),
-            cwd=data.get("cwd", "."),
-            profile=profile,
-        )
+            data = {
+                "tool_name": "AgentStop",
+                "tool_input": {"summary": "Agent turn completed"},
+                "cwd": os.getcwd(),
+                "session_id": "kiro",
+            }
+
+        event = _event_type(data)
+
+        if event == "UserPromptSubmit":
+            result = user_prompt_submit(
+                prompt=_prompt_from_data(data),
+                cwd=data.get("cwd", "."),
+                session_id=data.get("session_id", "unknown"),
+                profile=profile,
+                dry_run=dry_run,
+            )
+            if dry_run:
+                _echo_dry_run(result)
+        elif "tool_name" in data:
+            result = post_tool(data, profile=profile, dry_run=dry_run)
+            if dry_run:
+                _echo_dry_run(result)
+        else:
+            # Otherwise treat as compaction drain
+            result = pre_compact(
+                session_id=data.get("session_id", "unknown"),
+                cwd=data.get("cwd", "."),
+                profile=profile,
+                dry_run=dry_run,
+            )
+            if dry_run:
+                _echo_dry_run(result)
 
 
 @hooks_app.command(name="install")

@@ -75,6 +75,32 @@ class GatewayBackend:
         # Batch via individual stores for now
         return [self._post("/api/v1/memories", row) for row in rows]
 
+    def upsert_memory(self, memory: dict[str, Any]) -> dict[str, Any]:
+        """INSERT or UPDATE a memory by id for OKF round-trip imports.
+
+        The gateway has no native upsert endpoint, so this is a GET-then-PUT
+        (update if exists) or POST (insert if not). The gateway handles
+        embedding server-side, so the embedding field in ``memory`` is ignored.
+        access_count / last_accessed_at / created_at are preserved by the gateway
+        when updating because the PUT payload only includes content/tags/metadata/source.
+        """
+        memory_id: str = memory["id"]
+        profile = memory.get("profile", "default")
+        existing = self.get_memory_by_id(memory_id, profile)
+        update_payload = {
+            "content": memory.get("content", ""),
+            "tags": memory.get("tags") or [],
+            "metadata": memory.get("metadata") or {},
+            "source": memory.get("source"),
+            "profile": profile,
+        }
+        if existing is not None:
+            return self._put(f"/api/v1/memories/{memory_id}", update_payload)
+        return self._post(
+            "/api/v1/memories",
+            {"id": memory_id, **update_payload},
+        )
+
     def get_memory_by_id(self, memory_id: str, profile: str) -> dict[str, Any] | None:
         try:
             return self._get(f"/api/v1/memories/{memory_id}", {"profile": profile})
@@ -124,16 +150,19 @@ class GatewayBackend:
         limit: int | None = None,
         tags: list[str] | None = None,
         source: str | None = None,
+        profiles: list[str] | None = None,
+        query_entity_tags: list[str] | None = None,
+        recency_decay: float = 0.0,
     ) -> list[dict[str, Any]]:
-        return self._post(
-            "/api/v1/search",
-            {
-                "query": query_text,
-                "profile": profile,
-                "limit": limit,
-                "tags": tags,
-            },
-        )
+        body: dict[str, Any] = {
+            "query": query_text,
+            "profile": profile,
+            "limit": limit,
+            "tags": tags,
+        }
+        if profiles:
+            body["profiles"] = profiles
+        return self._post("/api/v1/search", body)
 
     def list_recent_memories(
         self,
@@ -265,3 +294,140 @@ class GatewayBackend:
             f"/api/v1/memories/{memory_id}/related",
             {"depth": depth, "limit": limit},
         )
+
+    def apply_hebbian_decay(self, profile: str, batch_size: int = 1000) -> int:
+        return 0
+
+    def count_decay_eligible(self, profile: str) -> int:
+        return 0
+
+    def emit_audit_event(self, *args: Any, **kwargs: Any) -> None:
+        pass  # Gateway handles its own audit server-side
+
+    def query_audit_log(
+        self, profile: str, limit: int = 50, operation: str | None = None
+    ) -> list[dict[str, Any]]:
+        return []  # Gateway audit: query via gateway API when available
+
+    # ========================================================================
+    # Wiki Tier 1 (v0.12) — gateway-backed implementations are stubbed.
+    # The managed-cloud product is parked; wiki tools require self-hosted
+    # backends (postgres or supabase) for v0.12. Will land alongside the
+    # gateway rehome (#90) when managed product comes back.
+    # ========================================================================
+
+    def _wiki_unsupported(self, op: str) -> None:
+        raise NotImplementedError(
+            f"GatewayBackend does not support wiki Tier 1 op {op!r}. "
+            "Use DATABASE_BACKEND=postgres or DATABASE_BACKEND=supabase."
+        )
+
+    def wiki_topic_search(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self._wiki_unsupported("wiki_topic_search")
+        return []
+
+    def wiki_topic_upsert(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self._wiki_unsupported("wiki_topic_upsert")
+        return {}
+
+    def wiki_topic_get_by_key(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        self._wiki_unsupported("wiki_topic_get_by_key")
+        return None
+
+    def wiki_topic_get_affected(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self._wiki_unsupported("wiki_topic_get_affected")
+        return []
+
+    def wiki_topic_mark_stale(self, *args: Any, **kwargs: Any) -> None:
+        self._wiki_unsupported("wiki_topic_mark_stale")
+
+    def wiki_topic_sweep_stale(self, *args: Any, **kwargs: Any) -> int:
+        self._wiki_unsupported("wiki_topic_sweep_stale")
+        return 0
+
+    def wiki_topic_list_stale(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self._wiki_unsupported("wiki_topic_list_stale")
+        return []
+
+    def wiki_topic_list_fresh_for_drift(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self._wiki_unsupported("wiki_topic_list_fresh_for_drift")
+        return []
+
+    def wiki_topic_list_all(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self._wiki_unsupported("wiki_topic_list_all")
+        return []
+
+    def wiki_recompute_get_source_ids(self, *args: Any, **kwargs: Any) -> list[str]:
+        self._wiki_unsupported("wiki_recompute_get_source_ids")
+        return []
+
+    def wiki_recompute_get_source_content(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self._wiki_unsupported("wiki_recompute_get_source_content")
+        return []
+
+    def wiki_walk_graph(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self._wiki_unsupported("wiki_walk_graph")
+        return []
+
+    def wiki_lint_contradictions(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self._wiki_unsupported("wiki_lint_contradictions")
+        return {"count": 0, "sample": []}
+
+    def gap_out_of_result_contradictions(
+        self, profile: str, memory_ids: list[str], *, sample_size: int = 10
+    ) -> dict[str, Any]:
+        # v1: gap deep-lookup not offered over the gateway. Degrade to empty.
+        return {"count": 0, "pairs": []}
+
+    def wiki_lint_orphans(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self._wiki_unsupported("wiki_lint_orphans")
+        return {"count": 0, "sample": []}
+
+    def wiki_lint_stale_lifecycle(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self._wiki_unsupported("wiki_lint_stale_lifecycle")
+        return {"count": 0, "sample": []}
+
+    # ========================================================================
+    # Lifecycle / Graph / Density (v0.13.1 — migration 035 RPC parity)
+    # Same parking pattern as wiki: gateway path is dormant; self-hosted
+    # backends (postgres or supabase) are the supported substrates.
+    # ========================================================================
+
+    def _lifecycle_unsupported(self, op: str) -> None:
+        raise NotImplementedError(
+            f"GatewayBackend does not support lifecycle/graph op {op!r}. "
+            "Use DATABASE_BACKEND=postgres or DATABASE_BACKEND=supabase."
+        )
+
+    def lifecycle_advance_stages(self, *args: Any, **kwargs: Any) -> int:
+        self._lifecycle_unsupported("lifecycle_advance_stages")
+        return 0
+
+    def lifecycle_close_editing_windows(self, *args: Any, **kwargs: Any) -> int:
+        self._lifecycle_unsupported("lifecycle_close_editing_windows")
+        return 0
+
+    def lifecycle_open_editing_window(self, *args: Any, **kwargs: Any) -> None:
+        self._lifecycle_unsupported("lifecycle_open_editing_window")
+
+    def lifecycle_pipeline_counts(self, *args: Any, **kwargs: Any) -> dict[str, int]:
+        self._lifecycle_unsupported("lifecycle_pipeline_counts")
+        return {"fresh": 0, "stable": 0, "editing": 0}
+
+    def hebbian_strengthen_edges(self, *args: Any, **kwargs: Any) -> int:
+        self._lifecycle_unsupported("hebbian_strengthen_edges")
+        return 0
+
+    def entity_graph_density(self, *args: Any, **kwargs: Any) -> tuple[float, float]:
+        self._lifecycle_unsupported("entity_graph_density")
+        return (0.0, 0.0)
+
+    def suggest_unlinked_by_shared_entities(
+        self, *args: Any, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        self._lifecycle_unsupported("suggest_unlinked_by_shared_entities")
+        return []
+
+    def link_memory_entities(self, *args: Any, **kwargs: Any) -> int:
+        self._lifecycle_unsupported("link_memory_entities")
+        return 0

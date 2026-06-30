@@ -53,14 +53,26 @@ from pathlib import Path
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
-EMBEDDING_BATCH_SIZE = 1000  # Voyage supports up to 1000
+# Per-provider batch size caps (avoids API "too many requests" errors).
+# Voyage supports 1000, Gemini caps at 100, OpenAI 500.
+# None = use provider default from settings.
+EMBEDDING_BATCH_SIZE: int | None = None
+# Graph augmentation depth. 0 = pure hybrid search. 1 = follow one hop of
+# memory_relationships edges to pull connected memories into top-K.
+# Default 0 -- experiments on 2026-04-06 showed graph_depth=1 with the current
+# memory-similarity graph hurts retrieval significantly across all categories
+# (-13 to -44pp) because similarity edges duplicate vector-search hits and
+# displace diverse evidence in the top-K. The win requires a real entity-
+# relationship graph (memory→entity edges), not memory→memory similarity.
+# Override via BEAM_GRAPH_DEPTH env var to experiment.
+BEAM_GRAPH_DEPTH: int = int(os.environ.get("BEAM_GRAPH_DEPTH", "0"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent
 RESULTS_DIR = DATA_DIR / "beam_results"
-DEFAULT_BEAM_DIR = Path("/tmp/BEAM")
+DEFAULT_BEAM_DIR = Path("/Users/kevinburns/Developer/web-projects/ogham-beam-dataset")
 
 ALL_CATEGORIES = [
     "abstention",
@@ -116,10 +128,19 @@ def load_chat(beam_dir: Path, bucket: str, chat_id: int) -> list[dict]:
 
     messages = []
     for batch in batches:
-        time_anchor = batch.get("time_anchor", "")
+        batch_anchor = batch.get("time_anchor", "")
         for turn in batch["turns"]:
             for msg in turn:
-                msg["_time_anchor"] = time_anchor
+                # Prefer message-level time_anchor over batch-level.
+                # BEAM messages have per-message anchors like "March-03-2024"
+                # while batch-level is often "None" (string).
+                msg_anchor = msg.get("time_anchor", "")
+                if msg_anchor and msg_anchor != "None" and msg_anchor != "null":
+                    msg["_time_anchor"] = msg_anchor
+                elif batch_anchor and batch_anchor != "None" and batch_anchor != "null":
+                    msg["_time_anchor"] = batch_anchor
+                else:
+                    msg["_time_anchor"] = ""
                 msg["_chat_id"] = chat_id
                 messages.append(msg)
     return messages
@@ -175,7 +196,7 @@ def ingest_chat(
             # Previous round complete, start new one
             rounds.append((current_anchor, current_round))
             current_round = []
-        current_anchor = msg.get("_time_anchor", current_anchor)
+        current_anchor = msg.get("_time_anchor") or current_anchor
         current_round.append(msg)
     if current_round:
         rounds.append((current_anchor, current_round))
@@ -215,9 +236,10 @@ def ingest_chat(
         }
         all_rows.append((content, tags, meta))
 
-    # Batch embed all rounds
+    # Batch embed all rounds (uses provider default batch size if None)
     all_texts = [r[0] for r in all_rows]
-    logger.info("  Embedding %d rounds (batch=%d)...", len(all_texts), EMBEDDING_BATCH_SIZE)
+    batch_label = EMBEDDING_BATCH_SIZE if EMBEDDING_BATCH_SIZE else "provider default"
+    logger.info("  Embedding %d rounds (batch=%s)...", len(all_texts), batch_label)
     embeddings = _with_retry(generate_embeddings_batch, all_texts, batch_size=EMBEDDING_BATCH_SIZE)
 
     # Batch insert into database
@@ -328,6 +350,7 @@ def evaluate_question(
         profile=profile,
         limit=max(top_k, 50),
         embedding=query_embedding,
+        graph_depth=BEAM_GRAPH_DEPTH,
     )
 
     # Gold answer: source_chat_ids field tells us which chat IDs contain the answer
@@ -372,26 +395,47 @@ def evaluate_question(
         else:
             hit_at[k] = 1.0 if category in ("abstention", "summarization") else 0.0
 
+    # For categories where empty gold = correct by definition (abstention,
+    # summarization with no source), treat all metrics as perfect.
+    no_gold_is_correct = not gold_msg_set and category in ("abstention", "summarization")
+
     # MRR: rank of first result containing a gold msg ID
-    mrr = 0.0
-    for i, r in enumerate(results):
-        meta = r.get("metadata", {})
-        r_msgs = set(str(m) for m in meta.get("msg_ids", []))
-        if r_msgs & gold_msg_set:
-            mrr = 1.0 / (i + 1)
-            break
+    if no_gold_is_correct:
+        mrr = 1.0
+    else:
+        mrr = 0.0
+        for i, r in enumerate(results):
+            meta = r.get("metadata", {})
+            r_msgs = set(str(m) for m in meta.get("msg_ids", []))
+            if r_msgs & gold_msg_set:
+                mrr = 1.0 / (i + 1)
+                break
 
     # NDCG@10
-    dcg = 0.0
-    for i, r in enumerate(results[:10]):
-        meta = r.get("metadata", {})
-        r_msgs = set(str(m) for m in meta.get("msg_ids", []))
-        if r_msgs & gold_msg_set:
-            dcg += 1.0 / math.log2(i + 2)
-    idcg = sum(1.0 / math.log2(i + 2) for i in range(min(len(gold_msg_set), 10)))
-    ndcg = dcg / idcg if idcg > 0 else 0.0
+    if no_gold_is_correct:
+        ndcg = 1.0
+    else:
+        dcg = 0.0
+        for i, r in enumerate(results[:10]):
+            meta = r.get("metadata", {})
+            r_msgs = set(str(m) for m in meta.get("msg_ids", []))
+            if r_msgs & gold_msg_set:
+                dcg += 1.0 / math.log2(i + 2)
+        idcg = sum(1.0 / math.log2(i + 2) for i in range(min(len(gold_msg_set), 10)))
+        ndcg = dcg / idcg if idcg > 0 else 0.0
 
-    return {
+    # Kendall tau-b for event_ordering (BEAM paper specifies this metric).
+    # For all other categories, tau_b is None (not applicable).
+    tau_b = None
+    if category == "event_ordering":
+        from beam_scoring import score_event_ordering
+
+        ordering_tested = question.get("ordering_tested", [])
+        if ordering_tested:
+            tau_result = score_event_ordering(ordering_tested, results)
+            tau_b = tau_result["kendall_tau_b"]
+
+    metrics = {
         "chat_id": chat_id,
         "category": category,
         "question": query[:120],
@@ -407,6 +451,9 @@ def evaluate_question(
         "gold_count": len(gold_msg_set),
         "retrieved_count": len(results),
     }
+    if tau_b is not None:
+        metrics["kendall_tau_b"] = tau_b
+    return metrics
 
 
 def evaluate_bucket(
@@ -452,9 +499,10 @@ def evaluate_bucket(
         logger.warning("No questions found")
         return {}
 
-    # Pre-batch all query embeddings (1000 at a time with Voyage)
+    # Pre-batch all query embeddings (provider default batch size)
     query_texts = [q[2]["question"] for q in all_questions]
-    logger.info("Pre-embedding %d queries (batch=%d)...", len(query_texts), EMBEDDING_BATCH_SIZE)
+    batch_label = EMBEDDING_BATCH_SIZE if EMBEDDING_BATCH_SIZE else "provider default"
+    logger.info("Pre-embedding %d queries (batch=%s)...", len(query_texts), batch_label)
     query_embeddings = _with_retry(
         generate_embeddings_batch, query_texts, batch_size=EMBEDDING_BATCH_SIZE
     )
@@ -694,7 +742,9 @@ Examples:
     if not args.beam_dir.exists():
         logger.error(
             "BEAM repo not found at %s. Clone it:\n"
-            "  git clone --depth 1 https://github.com/mohammadtavakoli78/BEAM /tmp/BEAM",
+            "  cd /Users/kevinburns/Developer/web-projects && "
+            "git clone --depth 1 https://github.com/mohammadtavakoli78/BEAM.git "
+            "ogham-beam-dataset",
             args.beam_dir,
         )
         sys.exit(1)

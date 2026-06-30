@@ -3,33 +3,198 @@
 Used by both the MCP tool layer (tools/memory.py) and the gateway REST API.
 Handles: content validation, date extraction, entity extraction,
 importance scoring, embedding generation, surprise scoring,
-storage, and auto-linking.
+storage, auto-linking, and optional read-time fact extraction.
 """
 
+import hashlib
 import logging
+import os
 import re
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
+from ogham.data.loader import get_direction_words
 from ogham.database import auto_link_memory as db_auto_link
+from ogham.database import (
+    create_relationship,
+    emit_audit_event,
+    hybrid_search_memories,
+    record_access,
+    spread_entity_activation,
+)
 from ogham.database import get_profile_ttl as db_get_profile_ttl
-from ogham.database import hybrid_search_memories, record_access
 from ogham.database import store_memory as db_store
-from ogham.embeddings import generate_embedding
+from ogham.embeddings import EmbeddingUsage, generate_embedding
 from ogham.extraction import (
     compute_importance,
+    detect_negation_polarity,
     extract_dates,
     extract_entities,
     extract_query_anchors,
     extract_recurrence,
     has_temporal_intent,
     is_broad_summary_query,
+    is_cross_reference_query,
     is_multi_hop_temporal,
     is_ordering_query,
+    reformulate_query,
     resolve_temporal_query,
 )
+from ogham.graph import strengthen_edges
+from ogham.lifecycle import open_editing_window
+from ogham.lifecycle_executor import submit as _lifecycle_submit
+from ogham.pricing import calculate_embedding_cost
+from ogham.topic_summaries import search_summaries
 
 logger = logging.getLogger(__name__)
+
+
+# v0.13: progressive-recall preamble level mapping. Mirrors tools/wiki.py
+# but kept duplicated to avoid the service layer importing the tools layer
+# (which would create an import cycle through ogham.app).
+_PREAMBLE_LEVEL_TO_COLUMN: dict[str, str] = {
+    "body": "content",
+    "short": "tldr_short",
+    "one_line": "tldr_one_line",
+}
+
+
+def _wiki_injection_results(
+    profile: str,
+    query_embedding: list[float],
+    *,
+    level: str = "short",
+) -> list[dict[str, Any]]:
+    """Top-K topic summaries to prepend to search results.
+
+    Returns an empty list when the feature flag is off, the embedding
+    is missing, or no fresh summary clears the similarity threshold.
+    Each result is shaped to look enough like a memory row that
+    downstream code (rerank, reorder, audit) doesn't crash on missing
+    fields, but is tagged `result_type="wiki_summary"` so callers can
+    render it as preamble rather than as a regular memory hit.
+
+    The injection is *additive* -- summaries don't count against the
+    caller's `limit`. Rationale: callers who say "give me 10 memories"
+    want 10 memories, plus whatever compiled context is relevant. If
+    a customer hits cost or token issues we can revisit by capping
+    total result size, but the cleaner default is "context preamble
+    on top of the asked-for results."
+
+    v0.13 progressive recall: ``level`` selects which column populates
+    the preamble's ``content``. Default 'short' (~150-300 tokens) cuts
+    typical preamble size 3-5x vs the v0.12 'body' default (~1000-2000
+    tokens). Falls back to body when the requested column is NULL on
+    the row (pre-033 schemas, or rows that failed three-form generation),
+    and reports the served level on each result so callers can audit
+    actual token cost.
+    """
+    from ogham.config import settings
+
+    if not settings.wiki_injection_enabled:
+        return []
+    if not query_embedding:
+        return []
+    if level not in _PREAMBLE_LEVEL_TO_COLUMN:
+        # Defensive: caller pumped a bad string through. Surface as if no
+        # preamble matched rather than crashing the search call.
+        logger.warning(
+            "wiki injection: unknown level %r, expected one of %s",
+            level,
+            sorted(_PREAMBLE_LEVEL_TO_COLUMN),
+        )
+        return []
+
+    try:
+        rows = search_summaries(
+            profile=profile,
+            query_embedding=query_embedding,
+            top_k=settings.wiki_injection_top_k,
+            min_similarity=settings.wiki_injection_min_similarity,
+        )
+    except Exception:
+        # Don't take the search path down if the wiki layer is unhealthy.
+        # Logged here, not raised -- BEAM/LME regression check pre-launch
+        # is when we want this signal to be loud, not at runtime.
+        logger.exception("wiki injection: search_summaries failed")
+        return []
+
+    if not rows:
+        return []
+
+    column = _PREAMBLE_LEVEL_TO_COLUMN[level]
+    injected: list[dict[str, Any]] = []
+    for row in rows:
+        served_level = level
+        fallback_reason: str | None = None
+        content = row.get(column)
+        if not content and level != "body":
+            # Pre-033 row, or row whose three-form generation didn't populate
+            # the requested column. Fall back to body; the caller pays more
+            # tokens than they wanted, but at least gets context.
+            content = row.get("content") or ""
+            served_level = "body"
+            fallback_reason = "tldr_column_null"
+        if content is None:
+            content = ""
+
+        entry: dict[str, Any] = {
+            "id": str(row["id"]),
+            "result_type": "wiki_summary",
+            "topic_key": row["topic_key"],
+            "content": content,
+            "level": served_level,
+            "source_count": row.get("source_count"),
+            "model_used": row.get("model_used"),
+            "version": row.get("version"),
+            "similarity": row.get("similarity"),
+            "tags": [f"wiki:{row['topic_key']}"],
+            "metadata": {
+                "wiki_summary_id": str(row["id"]),
+                "topic_key": row["topic_key"],
+                "version": row.get("version"),
+                "level": served_level,
+            },
+        }
+        # Only set requested_level / fallback_reason when a fallback occurred,
+        # matching the pattern in tools/wiki.py:query_topic_summary so the three
+        # tools (compile_wiki, query_topic_summary, hybrid_search wiki_preamble)
+        # report fallback consistently and callers can audit token cost.
+        if fallback_reason is not None:
+            entry["requested_level"] = level
+            entry["fallback_reason"] = fallback_reason
+        injected.append(entry)
+    return injected
+
+
+def _merge_embedding_usage(
+    total: EmbeddingUsage | None, current: EmbeddingUsage | None
+) -> EmbeddingUsage | None:
+    if current is None:
+        return total
+    if total is None:
+        return dict(current)
+
+    merged: EmbeddingUsage = dict(total)
+    current_tokens = current.get("input_tokens")
+    if current_tokens is not None:
+        merged["input_tokens"] = merged.get("input_tokens", 0) + current_tokens
+    if not merged.get("model"):
+        merged["model"] = current.get("model", "")
+    return merged
+
+
+def _audit_usage_fields(usage: EmbeddingUsage | None) -> dict[str, Any]:
+    if usage is None:
+        return {}
+    return {
+        "embedding_model": usage.get("model"),
+        "tokens_used": usage.get("input_tokens"),
+        "cost_usd": calculate_embedding_cost(usage),
+    }
 
 
 def store_memory_enriched(
@@ -45,6 +210,11 @@ def store_memory_enriched(
 
     Returns the stored memory dict with id, created_at, links_created, etc.
     """
+    from ogham.flow_control import disabled_payload, inscribe_enabled
+
+    if not inscribe_enabled():
+        return disabled_payload("inscribe", profile=profile)
+
     # Lazy import to avoid circular dependency with tools/memory.py
     from ogham.tools.memory import _require_content
 
@@ -76,23 +246,69 @@ def store_memory_enriched(
 
     # Compute importance score from content signals
     importance = compute_importance(content, tags)
+    # Preserve original importance for Hebbian decay recovery
+    if metadata is None:
+        metadata = {}
+    metadata["original_importance"] = importance
 
     # Generate embedding (skip if pre-computed, e.g. from gateway cache)
+    embedding_usage: EmbeddingUsage | None = None
     if embedding is None:
-        embedding = generate_embedding(content)
+        embedding_usage = {}
+        embedding = generate_embedding(content, usage_out=embedding_usage)
 
-    # Compute surprise score: how novel is this vs existing memories?
+    # Compute surprise score + detect conflicts (>75% similarity).
+    #
+    # PERF: this hybrid_search runs synchronously inside store_memory and
+    # was historically the dominant tail in store-latency p95 (Supabase
+    # panel showed 7-8s outliers on INSERTs because of this call). Two
+    # caps now bound the tail:
+    #
+    #   * limit=1 instead of 3 -- the surprise score only needs the top
+    #     neighbour, and the conflict warning is a soft hint where one
+    #     example is enough. Caps the work HNSW does per call.
+    #   * wall-clock timeout via ThreadPoolExecutor. If hybrid_search
+    #     doesn't return in OGHAM_CONFLICT_TIMEOUT_MS (default 1500ms),
+    #     we skip surprise scoring (default 0.5) and skip conflict
+    #     reporting. The store still completes.
+    #
+    # The timeout-via-thread pattern is sync-friendly: we don't actually
+    # cancel the in-flight RPC, but we stop waiting for it. The
+    # background thread's result is discarded.
     surprise = 0.5
+    conflicts: list[dict[str, Any]] = []
+    conflict_threshold = float(os.environ.get("OGHAM_CONFLICT_THRESHOLD", "0.75"))
+    conflict_timeout_ms = float(os.environ.get("OGHAM_CONFLICT_TIMEOUT_MS", "1500"))
     try:
-        existing = hybrid_search_memories(
-            query_text=content[:200],
-            query_embedding=embedding,
-            profile=profile,
-            limit=3,
-        )
+        with ThreadPoolExecutor(max_workers=1) as _pool:
+            _future = _pool.submit(
+                hybrid_search_memories,
+                query_text=content[:200],
+                query_embedding=embedding,
+                profile=profile,
+                limit=1,
+            )
+            existing = _future.result(timeout=conflict_timeout_ms / 1000.0)
         if existing:
             max_sim = max(r.get("similarity", 0) for r in existing)
             surprise = round(1.0 - max_sim, 3)
+            for r in existing:
+                sim = r.get("similarity", 0)
+                if sim >= conflict_threshold:
+                    conflicts.append(
+                        {
+                            "id": r.get("id", ""),
+                            "similarity": round(sim, 3),
+                            "content_preview": r.get("content", "")[:200],
+                        }
+                    )
+    except FuturesTimeout:
+        logger.warning(
+            "store_memory: surprise scoring timed out after %.0fms; "
+            "store proceeding with default surprise=0.5 "
+            "(tune via OGHAM_CONFLICT_TIMEOUT_MS)",
+            conflict_timeout_ms,
+        )
     except Exception:
         logger.debug("Surprise scoring skipped: search failed, using default 0.5")
 
@@ -116,6 +332,24 @@ def store_memory_enriched(
         surprise=surprise,
     )
 
+    # v0.14: Populate entities + memory_entities for the new row. Failure
+    # here is non-fatal -- the memory itself is already stored, and the
+    # backend gracefully degrades on deployments that haven't applied
+    # migration 036 yet (link_memory_entities returns 0 when entities
+    # tables are absent). This keeps spreading-activation, density, and
+    # suggest_connections fed without blocking ingest on graph plumbing.
+    if entity_tags:
+        try:
+            from ogham.database import get_backend
+
+            get_backend().link_memory_entities(
+                memory_id=str(result["id"]),
+                profile=profile,
+                entity_tags=entity_tags,
+            )
+        except Exception as exc:
+            logger.debug("link_memory_entities skipped: %s", exc)
+
     response: dict[str, Any] = {
         "status": "stored",
         "id": result["id"],
@@ -126,6 +360,59 @@ def store_memory_enriched(
         "surprise": surprise,
     }
 
+    if conflicts:
+        response["conflicts"] = conflicts
+        response["conflict_warning"] = (
+            f"Found {len(conflicts)} existing memory(s) with >{int(conflict_threshold * 100)}% "
+            "similarity. Consider using update_memory instead of storing a duplicate."
+        )
+
+    # Contradiction detection: if any conflicting memory has opposite polarity
+    # (one says "X", the other says "no longer X" / "replaced by Y"), create a
+    # `contradicts` relationship edge. Retrieval code can later suppress
+    # superseded memories using these edges. Heuristic is intentionally
+    # conservative -- false positives pollute the audit trail.
+    contradictions: list[dict[str, Any]] = []
+    if conflicts:
+        new_polarity = detect_negation_polarity(content)
+        for conflict in conflicts:
+            existing_polarity = detect_negation_polarity(conflict.get("content_preview", ""))
+            if new_polarity != existing_polarity:
+                try:
+                    create_relationship(
+                        source_id=str(result["id"]),
+                        target_id=str(conflict["id"]),
+                        relationship="contradicts",
+                        strength=1.0,
+                        created_by="auto",
+                        metadata={
+                            "similarity": conflict.get("similarity"),
+                            "reason": "opposite_polarity",
+                            "new_polarity": new_polarity,
+                            "existing_polarity": existing_polarity,
+                        },
+                    )
+                    contradictions.append(
+                        {
+                            "id": conflict["id"],
+                            "similarity": conflict.get("similarity"),
+                        }
+                    )
+                except Exception as exc:
+                    logger.debug("Contradicts edge skipped: %s", exc)
+
+    if contradictions:
+        response["contradicts"] = contradictions
+        emit_audit_event(
+            profile=profile,
+            operation="contradict_detected",
+            resource_id=str(result["id"]),
+            source=source,
+            result_ids=[c["id"] for c in contradictions],
+            result_count=len(contradictions),
+            metadata={"contradicted_ids": [c["id"] for c in contradictions]},
+        )
+
     # Auto-link
     if auto_link:
         links_created = db_auto_link(
@@ -135,7 +422,103 @@ def store_memory_enriched(
         )
         response["links_created"] = links_created
 
+    # Audit trail
+    emit_audit_event(
+        profile=profile,
+        operation="store",
+        resource_id=str(result["id"]),
+        source=source,
+        metadata={"importance": importance, "surprise": surprise},
+        **_audit_usage_fields(embedding_usage),
+    )
+
     return response
+
+
+def _read_time_extract(query: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract query-relevant facts from retrieved memories using an LLM.
+
+    Opt-in read-time extraction: the extractor sees both the query and the
+    retrieved context, producing focused facts for the caller. The raw
+    memories are still stored verbatim -- this is a presentation optimisation,
+    not a storage transformation.
+
+    Provider/model controlled via env vars:
+        OGHAM_EXTRACT_PROVIDER: "ollama", "gemini" (default), or "openai"
+        OGHAM_EXTRACT_MODEL: model name (defaults per provider)
+    """
+    if not results:
+        return results
+
+    parts = []
+    for i, r in enumerate(results):
+        content = r.get("content", "")
+        parts.append(f"## Memory {i + 1}\n{content}")
+    bundle = "\n\n".join(parts)
+
+    prompt = (
+        "Given a user's question and retrieved memory context, extract the facts "
+        "most relevant to answering the question.\n\n"
+        f"Question: {query}\n\n"
+        f"Memory context:\n{bundle}\n\n"
+        "Extract relevant facts as a concise bulleted list. Preserve specific "
+        "details: names, numbers, dates, locations. If the context contains no "
+        'relevant information, respond with "No relevant facts found."'
+    )
+
+    provider = os.environ.get("OGHAM_EXTRACT_PROVIDER", "gemini")
+    model = os.environ.get("OGHAM_EXTRACT_MODEL", "")
+
+    try:
+        if provider == "ollama":
+            import httpx
+
+            model = model or "gemma3:1b"
+            ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+            resp = httpx.post(
+                f"{ollama_host}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                },
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            facts = resp.json().get("message", {}).get("content", "")
+        elif provider == "openai":
+            from openai import OpenAI
+
+            client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            model = model or "gpt-4o-mini"
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            facts = response.choices[0].message.content or ""
+        else:
+            from google import genai  # pyright: ignore[reportAttributeAccessIssue]
+
+            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            client = genai.Client(api_key=api_key)
+            model = model or "gemini-2.5-flash"
+            response = client.models.generate_content(model=model, contents=prompt)
+            facts = response.text or ""
+    except Exception:
+        logger.warning("Read-time extraction failed, returning raw results")
+        return results
+
+    return [
+        {
+            "id": "extracted-facts",
+            "content": facts,
+            "metadata": {
+                "source_ids": [r.get("id", "") for r in results],
+                "extraction_model": f"{provider}:{model}",
+            },
+            "tags": ["extracted"],
+        }
+    ]
 
 
 def search_memories_enriched(
@@ -146,53 +529,353 @@ def search_memories_enriched(
     source: str | None = None,
     graph_depth: int = 0,
     embedding: list[float] | None = None,
+    profiles: list[str] | None = None,
+    extract_facts: bool = False,
 ) -> list[dict[str, Any]]:
-    """Full search pipeline: embed query, search, optional graph traversal, record access.
+    """Full search pipeline: retrieve, rerank (optional), record access.
 
-    If the query has temporal intent, resolves date references and boosts
-    results whose dates fall within the resolved range.
+    Pipeline stages:
+    1. _search_memories_raw: intent detection, retrieval, temporal/entity enrichment
+    2. _maybe_rerank: optional FlashRank cross-encoder reranking (RERANK_ENABLED=true)
+    3. Record access for retrieved memories
+    4. (opt-in) _read_time_extract: LLM-powered fact extraction from results
 
-    Elastic K: ordering, summary, and multi-session queries automatically
-    expand the result limit to 2x for broader coverage of scattered facts.
-    Point queries (extraction, preference) keep the original limit.
+    Args:
+        extract_facts: When True, runs retrieved memories through an LLM to
+            extract query-relevant facts. Returns a single extracted-facts
+            result instead of raw memories. Default: False (verbatim results).
     """
+    from ogham.flow_control import recall_enabled
+
+    if not recall_enabled():
+        return []
+
+    embedding_usage: EmbeddingUsage | None = None
+
     if embedding is None:
-        embedding = generate_embedding(query)
+
+        def _generate_embedding_with_usage_tracking(text: str) -> list[float]:
+            nonlocal embedding_usage
+            current_usage: EmbeddingUsage = {}
+            result = generate_embedding(text, usage_out=current_usage)
+            embedding_usage = _merge_embedding_usage(embedding_usage, current_usage or None)
+            return result
+
+        embedding = _generate_embedding_with_usage_tracking(query)
+        embedding_generator = _generate_embedding_with_usage_tracking
+    else:
+        embedding_generator = generate_embedding
+
+    results = _search_memories_raw(
+        query,
+        profile,
+        limit,
+        tags,
+        source,
+        graph_depth,
+        embedding,
+        profiles,
+        embedding_generator=embedding_generator,
+    )
+
+    if results:
+        results = _maybe_rerank(query, results, limit)
+        results = _reorder_for_attention(results)
+        record_access([r["id"] for r in results])
+
+    # Wiki Tier 1 context injection lives at the MCP-tool layer
+    # (tools/memory.py::hybrid_search), not here. Keeping
+    # search_memories_enriched as a pure retrieval engine means
+    # benchmarks (BEAM/LME) and other callers that want raw retrieval
+    # are not measurement-polluted by preamble rows. _wiki_injection_results
+    # remains exported from this module so the tool layer can call it
+    # without redundant embedding generation.
+
+    # Audit trail
+    result_ids = [str(r["id"]) for r in results] if results else []
+    emit_audit_event(
+        profile=profile,
+        operation="search",
+        result_ids=result_ids or None,
+        result_count=len(results),
+        query_hash=hashlib.sha256(query.encode()).hexdigest()[:16],
+        **_audit_usage_fields(embedding_usage),
+    )
+
+    # Lifecycle side-effects run off the hot path. Failures are logged
+    # inside the executor; search returns immediately.
+    # - open_editing_window: STABLE -> EDITING promotion (FRESH filtered internally)
+    # - strengthen_edges: Hebbian co-retrieval strengthens pairwise edges
+    if results:
+        ids = [str(r["id"]) for r in results]
+        _lifecycle_submit(open_editing_window, ids)
+        _lifecycle_submit(strengthen_edges, ids)
+
+    if extract_facts and results:
+        results = _read_time_extract(query, results)
+
+    return results
+
+
+def build_timeline_table(
+    results: list[dict],
+    reference_date: datetime | None = None,
+) -> str:
+    """Build a chronological timeline table from retrieved memories.
+
+    Extracts dates from each memory, sorts chronologically, computes
+    "days ago" relative to reference_date (defaults to now), and creates
+    a Markdown table with memory ID hard links (M1, M3, etc.).
+
+    Returns an empty string if fewer than 2 dated events are found.
+    """
+    ref_dt = reference_date or datetime.now(timezone.utc)
+    ref_dt_naive = ref_dt.replace(tzinfo=None)
+
+    # Collect and parse dates
+    dated_events = []
+    for idx, r in enumerate(results, 1):
+        content = r.get("content", "")
+        meta = r.get("metadata") or {}
+        dates = meta.get("dates") or extract_dates(content)
+
+        if dates:
+            summary = content[:100].replace("\n", " ")
+            for d in dates:
+                dated_events.append({"date": d, "summary": summary, "idx": idx})
+
+    if len(dated_events) < 2:
+        return ""
+
+    # Group by date (dict preserves insertion order in Python 3.7+)
+    dated_events.sort(key=lambda x: x["date"])
+    day_groups: dict[str, list[dict]] = {}
+    for ev in dated_events:
+        day_groups.setdefault(ev["date"], []).append(ev)
+
+    # Build table
+    ref_str = ref_dt.strftime("%Y-%m-%d")
+    lines = [
+        f"### CHRONOLOGICAL TIMELINE (Today = {ref_str}) ###",
+        "| Date | Event Summary | Days Ago | Ref |",
+        "|:---|:---|:---|:---|",
+    ]
+
+    for date_str, entries in list(day_groups.items())[:20]:
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")  # noqa: DTZ007
+            delta = (ref_dt_naive - dt).days
+            ago = f"{delta} days" if delta > 0 else "TODAY"
+        except ValueError:
+            ago = "---"
+
+        summary = " + ".join(e["summary"][:35] for e in entries)
+        refs = ", ".join(f"M{e['idx']}" for e in entries)
+        lines.append(f"| {date_str} | {summary[:38]} | {ago} | {refs} |")
+
+    lines.append(f"| {ref_str} | >>> TODAY (reference point) <<< | TODAY | |")
+
+    return "\n".join(lines)
+
+
+def format_results_with_sessions(
+    results: list[dict],
+    reference_date: datetime | None = None,
+    include_timeline: bool = True,
+) -> str:
+    """Format search results with session headers, entity tags, and optional timeline.
+
+    Produces a structured context string ready for LLM consumption:
+    - Timeline table at the top (if enough dated events)
+    - Session boundary headers between different conversation dates
+    - Entity and date annotations per memory
+
+    Args:
+        results: Search results from search_memories_enriched.
+        reference_date: Reference date for timeline "days ago" computation.
+        include_timeline: Whether to include the timeline table.
+
+    Returns:
+        Formatted context string with session headers and annotations.
+    """
+    parts = []
+
+    if include_timeline:
+        timeline = build_timeline_table(results, reference_date=reference_date)
+        if timeline:
+            parts.append(timeline)
+            parts.append("")
+
+    current_session = None
+    for idx, r in enumerate(results, 1):
+        content = r.get("content", "")
+        if not content:
+            continue
+
+        # Detect session date from metadata or content prefix
+        meta = r.get("metadata") or {}
+        session_date = meta.get("date")
+        if not session_date:
+            import re
+
+            date_match = re.match(r"\[Date:\s*([^\]]+)\]", content)
+            if date_match:
+                session_date = date_match.group(1).strip()
+            elif r.get("created_at"):
+                session_date = str(r["created_at"])[:10]
+
+        if session_date and session_date != current_session:
+            parts.append(f"\n=== SESSION: {session_date} ===")
+            current_session = session_date
+
+        # Entity and date annotations
+        entity_tags = extract_entities(content)
+        dates = extract_dates(content)
+
+        annotations = []
+        if entity_tags:
+            annotations.append(f"Entities: {', '.join(entity_tags)}")
+        if dates:
+            annotations.append(f"Dates: {', '.join(dates)}")
+
+        if annotations:
+            parts.append(f"[Memory {idx}] {content}\n[{' | '.join(annotations)}]")
+        else:
+            parts.append(f"[Memory {idx}] {content}")
+
+    return "\n---\n".join(parts)
+
+
+def _reorder_for_attention(results: list[dict]) -> list[dict]:
+    """Reorder results to combat 'Lost in the Middle' (Liu et al. 2023).
+
+    LLMs attend better to items at the start and end of the context.
+    Put top 30% first, bottom 20% last, middle items in between.
+    """
+    if len(results) < 5:
+        return results
+    n = len(results)
+    top = results[: max(1, n * 3 // 10)]
+    bottom = results[max(1, n * 8 // 10) :]
+    middle = results[max(1, n * 3 // 10) : max(1, n * 8 // 10)]
+    return top + middle + bottom
+
+
+def _maybe_rerank(query: str, results: list[dict], limit: int) -> list[dict]:
+    """Apply cross-encoder reranking if enabled via RERANK_ENABLED."""
+    from ogham.config import settings
+
+    if not settings.rerank_enabled:
+        return results
+    from ogham.reranker import rerank_results
+
+    return rerank_results(query, results, top_k=limit, alpha=settings.rerank_alpha)
+
+
+def _search_memories_raw(
+    query: str,
+    profile: str,
+    limit: int = 10,
+    tags: list[str] | None = None,
+    source: str | None = None,
+    graph_depth: int = 0,
+    embedding: list[float] | None = None,
+    profiles: list[str] | None = None,
+    embedding_generator: Callable[[str], list[float]] = generate_embedding,
+) -> list[dict[str, Any]]:
+    """Retrieve memories via intent-aware search paths. No reranking, no access recording."""
+    if embedding is None:
+        embedding = embedding_generator(query)
+
+    # OGHAM_BENCH_RAW=true / OGHAM_BENCH_MODE=true short-circuits to a plain
+    # hybrid_search_memories call with no reformulation, no entity extraction,
+    # no intent branching, no activation merge. BENCH_MODE additionally
+    # routes to the sterile SQL function (no access_count / graph_boost /
+    # entity_overlap multipliers) — see backends/postgres.py. Used for
+    # apples-to-apples retrieval benchmarks across releases. Never enable
+    # in production.
+    _bench_raw = os.environ.get("OGHAM_BENCH_RAW", "").lower() in ("true", "1", "yes")
+    _bench_mode = os.environ.get("OGHAM_BENCH_MODE", "").lower() in ("true", "1", "yes")
+    if _bench_raw or _bench_mode:
+        return hybrid_search_memories(
+            query_text=query,
+            query_embedding=embedding,
+            profile=profile,
+            limit=limit,
+            tags=tags,
+            source=source,
+            profiles=profiles,
+        )
+
+    # Query reformulation is gated per-intent (v0.10.1). Global application
+    # regressed MRR in v0.9.2 because it stripped filler words that temporal
+    # and multi-hop paths depend on. We apply it only on the standard
+    # (info-extraction / simple-lookup) path: specialised-intent branches
+    # return early below before reaching the standard hybrid_search call,
+    # so reformulation only kicks in when none of them fire AND the query
+    # has no temporal intent.
+    search_query = query
+    reformulated = None
+    if not (
+        is_ordering_query(query)
+        or is_multi_hop_temporal(query)
+        or is_cross_reference_query(query)
+        or is_broad_summary_query(query)
+        or has_temporal_intent(query)
+    ):
+        reformulated = reformulate_query(query)
+        if reformulated and reformulated != query:
+            search_query = reformulated
+
+    # Entity overlap boost: extract entity tags from the query and pass to SQL.
+    # Memories sharing entities with the query get up to 1.3x relevance boost.
+    # See docs/plans/2026-04-06-entity-graph-spreading-activation.md Stage 1.
+    query_entities = extract_entities(query)
+    query_entity_tags = query_entities if query_entities else None
 
     # Elastic K: set-queries (ordering, summary, multi-session) get 2x limit
     # for broader coverage of scattered facts across the timeline.
     elastic_limit = limit * 2
 
-    # Ordering queries: strided retrieval + entity threading + chronological sort
+    # Ordering queries: strided retrieval + activation + chronological sort
     if is_ordering_query(query):
         results = hybrid_search_memories(
-            query_text=query,
+            query_text=search_query,
             query_embedding=embedding,
             profile=profile,
             limit=elastic_limit * 5,
             tags=tags,
             source=source,
+            profiles=profiles,
+            query_entity_tags=query_entity_tags,
         )
         if results:
-            # Strided retrieval first: ensure broad timeline coverage
-            strided = _strided_retrieval(results, elastic_limit * 2)
-            # Entity threading on strided results for full entity history
-            threaded = _entity_thread(
-                strided, query, embedding, profile, elastic_limit * 2, tags, source
-            )
-            # Sort by date extracted from content, then trim
-            for r in threaded:
+            results = _strided_retrieval(results, elastic_limit * 2)
+        results = _merge_activation_results(
+            results or [],
+            query_entity_tags,
+            profile,
+            elastic_limit * 2,
+            graph_fraction=0.5,
+        )
+        if results:
+            for r in results:
                 r["_sort_date"] = _extract_memory_date(r) or "9999"
-            threaded.sort(key=lambda r: r["_sort_date"])
-            results = threaded[:elastic_limit]
-            record_access([r["id"] for r in results])
+            results.sort(key=lambda r: r["_sort_date"])
+            results = results[:elastic_limit]
         return results
 
     # Multi-hop temporal: entity-centric bridge retrieval + threading
     if is_multi_hop_temporal(query):
-        bridge_results = _bridge_retrieval(query, profile, elastic_limit, tags, source)
+        bridge_results = _bridge_retrieval(
+            query,
+            profile,
+            elastic_limit,
+            tags,
+            source,
+            embedding_generator,
+        )
         if bridge_results:
-            # Merge bridge results with standard search
             results = _merge_bridge_results(
                 bridge_results,
                 query,
@@ -202,44 +885,70 @@ def search_memories_enriched(
                 tags,
                 source,
             )
-            # Entity threading on merged results for full entity history
             if results:
                 results = _entity_thread(
-                    results,
-                    query,
-                    embedding,
-                    profile,
-                    elastic_limit,
-                    tags,
-                    source,
+                    results, query, embedding, profile, elastic_limit, tags, source
                 )
-                record_access([r["id"] for r in results])
             return results
 
-    # Broad summary queries: strided retrieval for timeline coverage
+    # Cross-reference queries: spreading activation for entity bridging.
+    # Two parallel signals: hybrid search (semantic + keyword) + entity graph
+    # walk (spreading activation). Merge boosts hybrid results by activation
+    # score but limits bridge doc injection (graph_fraction=0.15) to avoid
+    # displacing the gold answer at rank 1.
+    if is_cross_reference_query(query):
+        results = hybrid_search_memories(
+            query_text=search_query,
+            query_embedding=embedding,
+            profile=profile,
+            limit=elastic_limit * 3,
+            tags=tags,
+            source=source,
+            profiles=profiles,
+            query_entity_tags=query_entity_tags,
+        )
+        return _merge_activation_results(
+            results or [],
+            query_entity_tags,
+            profile,
+            elastic_limit,
+            graph_fraction=0.15,
+        )
+
+    # Broad summary queries: strided retrieval + activation for entity diversity.
     if is_broad_summary_query(query):
         results = hybrid_search_memories(
-            query_text=query,
+            query_text=search_query,
             query_embedding=embedding,
             profile=profile,
             limit=elastic_limit * 5,
             tags=tags,
             source=source,
+            profiles=profiles,
+            query_entity_tags=query_entity_tags,
         )
         if results:
             results = _strided_retrieval(results, elastic_limit)
-            results = _mmr_rerank(results, embedding, elastic_limit, lambda_param=0.5)
-            record_access([r["id"] for r in results])
+        results = _merge_activation_results(
+            results or [],
+            query_entity_tags,
+            profile,
+            elastic_limit,
+            graph_fraction=0.4,
+        )
         return results
 
-    # Standard search path
-    fetch_limit = limit * 3 if has_temporal_intent(query) else limit
+    # Standard search path — fetch wider pool for TDR density check.
+    # NOTE: temporal queries keep limit*3 (not higher) — increasing to 5x
+    # regressed temporal-reasoning by -1.5pp because extra candidates dilute
+    # _temporal_rerank's top-k. Non-temporal gets 3x for TDR headroom.
+    fetch_limit = limit * 3
 
     if graph_depth > 0:
         from ogham.database import graph_augmented_search
 
         results = graph_augmented_search(
-            query_text=query,
+            query_text=search_query,
             query_embedding=embedding,
             profile=profile,
             limit=fetch_limit,
@@ -248,22 +957,32 @@ def search_memories_enriched(
             source=source,
         )
     else:
+        # Standard path gets gated recency decay (0.01 = ~69-day half-life).
+        # Ordering and summary paths above do NOT get recency decay because
+        # they need evidence from across the full timeline.
         results = hybrid_search_memories(
-            query_text=query,
+            query_text=search_query,
             query_embedding=embedding,
             profile=profile,
             limit=fetch_limit,
             tags=tags,
             source=source,
+            profiles=profiles,
+            query_entity_tags=query_entity_tags,
+            recency_decay=0.01,
         )
+
+    # Temporal Diversity Re-ranking (TDR): density-gated soft penalty.
+    # Fires only when top-20 results are temporally clustered (≥80% in ≤5%
+    # of the total time-range). Prevents semantic density collapse on
+    # multi-session counting queries without forced injection.
+    if results and len(results) > limit:
+        results = _tdr_rerank(results, limit)
 
     # Single-anchor temporal re-ranking
     if results and has_temporal_intent(query):
         results = _temporal_rerank(results, query)
         results = results[:limit]
-
-    if results:
-        record_access([r["id"] for r in results])
 
     return results
 
@@ -274,6 +993,7 @@ def _bridge_retrieval(
     limit: int,
     tags: list[str] | None,
     source: str | None,
+    embedding_generator: Callable[[str], list[float]] = generate_embedding,
 ) -> list[dict[str, Any]]:
     """Entity-centric bridge retrieval for multi-hop temporal queries.
 
@@ -290,7 +1010,7 @@ def _bridge_retrieval(
     all_results = []
     for anchor in anchors:
         # Path A: Semantic + keyword hybrid search
-        anchor_embedding = generate_embedding(anchor)
+        anchor_embedding = embedding_generator(anchor)
         results = hybrid_search_memories(
             query_text=anchor,
             query_embedding=anchor_embedding,
@@ -396,7 +1116,7 @@ def _exact_content_search(anchor: str, profile: str, limit: int) -> list[dict[st
     """
     from ogham.database import get_backend
 
-    backend = get_backend()
+    backend = cast(Any, get_backend())
 
     # Extract the most specific word from the anchor (longest, likely a name)
     words = [w for w in anchor.split() if len(w) > 2]
@@ -437,18 +1157,135 @@ def _exact_content_search(anchor: str, profile: str, limit: int) -> list[dict[st
                 .limit(limit)
                 .execute()
             )
-            return result.data if result.data else []
+            return cast(list[dict[str, Any]], result.data) if result.data else []
     except Exception as e:
         logger.debug("Exact content search failed for '%s': %s", search_term, e)
 
     return []
 
 
+def _tdr_rerank(
+    results: list[dict[str, Any]],
+    limit: int,
+    density_threshold: float = 0.80,
+    spread_threshold: float = 0.05,
+    decay_lambda: float = 0.8,
+    null_date_penalty: float = 0.95,
+) -> list[dict[str, Any]]:
+    """Temporal Diversity Re-ranking with density gating.
+
+    Prevents semantic density collapse on multi-session counting queries
+    by soft-penalising results from already-represented dates. Only fires
+    when the top-20 results are temporally clustered.
+
+    Design: Gemini 3.1 Pro stress-test (2026-04-11), refined via three
+    peer-review rounds. Key principle: SOFT re-ranking only, never forced
+    injection (boundary-anchoring regressed -1.5pp on temporal-reasoning).
+
+    Args:
+        density_threshold: gate fires when this fraction of top-20 falls
+            within spread_threshold of the total time-range (default 0.80)
+        spread_threshold: what fraction of total time-range counts as
+            "clustered" (default 0.05 = 5%)
+        decay_lambda: penalty base per duplicate date (default 0.8)
+        null_date_penalty: baseline multiplier for date-less memories (0.95)
+    """
+    if len(results) <= limit:
+        return results
+
+    # Extract dates for all candidates
+    dated_results: list[tuple[str | None, int, dict]] = []
+    for i, r in enumerate(results):
+        d = _extract_memory_date(r)
+        dated_results.append((d, i, r))
+
+    # Compute temporal spread ratio on top-20
+    top_20 = dated_results[:20]
+    all_dates = [d for d, _, _ in dated_results if d is not None]
+    top_20_dates = [d for d, _, _ in top_20 if d is not None]
+
+    if len(all_dates) < 2 or len(top_20_dates) < 2:
+        # Not enough dated memories to compute spread — pass through
+        return results[:limit]
+
+    all_dates_sorted = sorted(all_dates)
+    total_range_days = max(
+        1,
+        (_date_to_ordinal(all_dates_sorted[-1]) - _date_to_ordinal(all_dates_sorted[0])),
+    )
+
+    top_20_sorted = sorted(top_20_dates)
+    top_20_range_days = _date_to_ordinal(top_20_sorted[-1]) - _date_to_ordinal(top_20_sorted[0])
+
+    spread_ratio = top_20_range_days / total_range_days if total_range_days > 0 else 1.0
+    top_20_concentration = len(top_20_dates) / max(len(top_20), 1)
+
+    # Density gate: do top-20 cluster in a narrow time band?
+    if not (top_20_concentration >= density_threshold and spread_ratio <= spread_threshold):
+        # Top-20 are already diverse — no TDR needed
+        return results[:limit]
+
+    logger.debug(
+        "TDR gate fired: %.0f%% of top-20 in %.1f%% of time-range (threshold: %.0f%%/%.0f%%)",
+        top_20_concentration * 100,
+        spread_ratio * 100,
+        density_threshold * 100,
+        spread_threshold * 100,
+    )
+
+    # Greedy selection with soft date-penalty
+    selected: list[dict] = []
+    date_counts: dict[str, int] = {}
+    _null_counter = 0
+
+    for date_str, _orig_idx, r in dated_results:
+        if len(selected) >= limit:
+            break
+
+        relevance = r.get("relevance", 0.0)
+
+        if date_str is None:
+            # Null-date: unique virtual bucket per memory + baseline penalty
+            _null_counter += 1
+            bucket = f"_null_{_null_counter}"
+            penalty = null_date_penalty
+        else:
+            bucket = date_str
+            count = date_counts.get(bucket, 0)
+            penalty = decay_lambda**count
+
+        adjusted_score = relevance * penalty
+
+        # Only select if the adjusted score is positive
+        if adjusted_score > 0:
+            r["_tdr_adjusted"] = adjusted_score
+            r["_tdr_bucket"] = bucket
+            selected.append(r)
+            date_counts[bucket] = date_counts.get(bucket, 0) + 1
+
+    # Re-sort by adjusted score (highest first)
+    selected.sort(key=lambda r: r.get("_tdr_adjusted", 0), reverse=True)
+
+    return selected[:limit]
+
+
+def _date_to_ordinal(date_str: str) -> int:
+    """Convert YYYY-MM-DD string to an ordinal day number for arithmetic."""
+    try:
+        parts = date_str.split("-")
+        from datetime import date
+
+        return date(int(parts[0]), int(parts[1]), int(parts[2])).toordinal()
+    except (ValueError, IndexError):
+        return 0
+
+
 _CONTENT_DATE_RE = re.compile(r"\[Date:\s*(\d{4}-\d{2}-\d{2})\]")
 
 # Direction keywords for asymmetric temporal decay
-_AFTER_WORDS = frozenset({"after", "since", "following", "subsequent", "later"})
-_BEFORE_WORDS = frozenset({"before", "prior", "previous", "earlier", "preceding"})
+_dir = get_direction_words("en")
+_AFTER_WORDS = frozenset(_dir.get("after", []))
+_BEFORE_WORDS = frozenset(_dir.get("before", []))
 
 
 def _extract_memory_date(r: dict[str, Any]) -> str | None:
@@ -467,6 +1304,96 @@ def _extract_memory_date(r: dict[str, Any]) -> str | None:
         return created
 
     return None
+
+
+def _boundary_anchored_inject(
+    results: list[dict[str, Any]],
+    query: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Force-inject the chronological boundary nodes into the result set.
+
+    For temporal-reasoning queries ("how long since X", "how many weeks between"),
+    the reader needs the earliest and latest mentions relative to the query's
+    temporal anchor to establish the timeline boundaries. Without them it
+    guesses dates or returns "no information".
+
+    Algorithm (per Gemini 3.1 Pro stress-test, 2026-04-11):
+      1. Extract dates from all candidates
+      2. Find top-1 chronologically BEFORE the anchor (or earliest overall)
+      3. Find top-1 chronologically AFTER the anchor (or latest overall)
+      4. Force-inject both into the result set (deduplicated)
+      5. Fill remaining slots from the semantic ranker
+
+    This is a deterministic boundary lookup, not a diversity re-ranker.
+    Immune to thin-profile risk because it doesn't care about density.
+    """
+    if not results or len(results) <= 2:
+        return results
+
+    # Date every candidate
+    dated: list[tuple[str, dict]] = []
+    for r in results:
+        d = _extract_memory_date(r)
+        if d:
+            dated.append((d, r))
+
+    if len(dated) < 2:
+        return results  # not enough dated memories to establish boundaries
+
+    dated.sort(key=lambda x: x[0])
+
+    # Try to find anchor date from query via extract_dates
+    from ogham.extraction import extract_dates
+
+    query_dates = extract_dates(query)
+    if query_dates:
+        # Use the first extracted date as anchor
+        anchor = query_dates[0]
+    else:
+        # No explicit anchor — use the midpoint of the date range
+        anchor = dated[len(dated) // 2][0]
+
+    # Boundary: latest memory BEFORE anchor
+    before = None
+    for date_str, r in reversed(dated):
+        if date_str <= anchor:
+            before = r
+            break
+
+    # Boundary: earliest memory AFTER anchor
+    after = None
+    for date_str, r in dated:
+        if date_str >= anchor:
+            after = r
+            break
+
+    # If anchor is outside the range, use the edges
+    if before is None:
+        before = dated[0][1]
+    if after is None:
+        after = dated[-1][1]
+
+    # Force-inject boundary nodes at the front, deduped
+    seen_ids: set[str] = set()
+    injected: list[dict] = []
+
+    for boundary in [before, after]:
+        rid = str(boundary.get("id", ""))
+        if rid and rid not in seen_ids:
+            seen_ids.add(rid)
+            injected.append(boundary)
+
+    # Fill remaining slots from the original order, deduped
+    for r in results:
+        if len(injected) >= limit:
+            break
+        rid = str(r.get("id", ""))
+        if rid not in seen_ids:
+            seen_ids.add(rid)
+            injected.append(r)
+
+    return injected[:limit]
 
 
 def _detect_direction(query: str) -> str:
@@ -815,6 +1742,281 @@ def _strided_retrieval(results: list[dict], limit: int) -> list[dict]:
             diversified.append(r)
 
     return diversified[:limit]
+
+
+def _graph_rerank(
+    results: list[dict],
+    query_entity_tags: list[str] | None,
+    profile: str,
+    boost_weight: float = 0.3,
+) -> list[dict]:
+    """Re-rank results using structured entity graph connectivity.
+
+    Uses the memory_entities table to boost results that share entities
+    with the query and with each other. Unlike _entity_thread (which does
+    a second text search), this only re-ranks existing results -- no new
+    candidates, no dilution.
+
+    Boost = (query_overlap + cross_connectivity) * boost_weight
+    - query_overlap: fraction of query entities found in this result's entities
+    - cross_connectivity: fraction of result's entities shared by 2+ other results
+    """
+    if not results or len(results) <= 1:
+        return results
+
+    from ogham.backends.postgres import PostgresBackend
+    from ogham.database import get_backend
+
+    backend = get_backend()
+    if not isinstance(backend, PostgresBackend):
+        return results
+
+    # Batch lookup: get entity IDs for all result memory IDs
+    mem_ids = [r.get("id") for r in results if r.get("id")]
+    if not mem_ids:
+        return results
+
+    try:
+        pool = backend._get_pool()
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                # Get entity sets for each memory in the result set
+                cur.execute(
+                    """
+                    SELECT me.memory_id, array_agg(e.canonical_name || ':' || e.entity_type)
+                    FROM memory_entities me
+                    JOIN entities e ON e.id = me.entity_id
+                    WHERE me.memory_id = ANY(%s) AND me.profile = %s
+                    GROUP BY me.memory_id
+                    """,
+                    (mem_ids, profile),
+                )
+                mem_entities: dict[str, set[str]] = {}
+                for mid, ents in cur.fetchall():
+                    mem_entities[str(mid)] = set(ents)
+    except Exception:
+        return results
+
+    if not mem_entities:
+        return results
+
+    # Build entity frequency map across all results (for connectivity scoring)
+    entity_freq: dict[str, int] = {}
+    for ents in mem_entities.values():
+        for e in ents:
+            entity_freq[e] = entity_freq.get(e, 0) + 1
+
+    # Normalise query entity tags for matching (e.g. "person:John" -> "John:person")
+    query_ent_set: set[str] = set()
+    if query_entity_tags:
+        for tag in query_entity_tags:
+            parts = tag.split(":", 1)
+            if len(parts) == 2:
+                query_ent_set.add(f"{parts[1]}:{parts[0]}")
+
+    # Score each result
+    for r in results:
+        rid = str(r.get("id", ""))
+        ents = mem_entities.get(rid, set())
+        if not ents:
+            continue
+
+        # 1. Query overlap: what fraction of query entities does this memory have?
+        query_overlap = 0.0
+        if query_ent_set:
+            overlap = len(ents & query_ent_set)
+            query_overlap = overlap / len(query_ent_set)
+
+        # 2. Cross-connectivity: what fraction of this memory's entities appear
+        #    in 2+ other results? (shared entities = topical cluster)
+        shared = sum(1 for e in ents if entity_freq.get(e, 0) >= 2)
+        connectivity = shared / len(ents) if ents else 0.0
+
+        # Combined boost (capped at 1.0 to prevent over-boosting)
+        boost = min(1.0, query_overlap + connectivity * 0.5) * boost_weight
+
+        if "relevance" in r and r["relevance"] is not None:
+            r["relevance"] = r["relevance"] * (1.0 + boost)
+
+    results.sort(key=lambda r: r.get("relevance", 0), reverse=True)
+    return results
+
+
+_DENSITY_CACHE: dict[str, tuple[float, float]] = {}
+_DENSITY_TTL_SECONDS = 300.0
+
+
+def _profile_graph_density(profile: str) -> float:
+    """Measure entity graph density (edges per entity) for a profile.
+
+    Returns edges-per-entity ratio. Dense profiles (single-chat, BEAM-style)
+    typically return 2-4. Sparse multi-session profiles return closer to 1.
+
+    Cached for 5 minutes per profile to avoid repeated queries. Falls back
+    to 2.0 (neutral) on error.
+    """
+    import time as _time
+
+    now = _time.time()
+    cached = _DENSITY_CACHE.get(profile)
+    if cached and (now - cached[1]) < _DENSITY_TTL_SECONDS:
+        return cached[0]
+
+    try:
+        from ogham.database import get_backend
+
+        # v0.13.1: route through facade so Supabase works (was raising
+        # AttributeError on _execute and silently degrading to 2.0).
+        entities, edges = get_backend().entity_graph_density(profile)
+        if entities > 0:
+            density = edges / entities
+        else:
+            density = 2.0
+    except Exception:
+        density = 2.0
+
+    _DENSITY_CACHE[profile] = (density, now)
+    return density
+
+
+def _density_adaptive_activation_weight(
+    profile: str,
+    base_weight: float = 0.15,
+    min_weight: float = 0.05,
+    max_weight: float = 0.30,
+) -> float:
+    """Scale activation weight inversely with graph density.
+
+    Pattern from Shodh (varun29ankuS/shodh-memory): sparse entity graphs
+    have higher-signal edges (Hebbian-pruned), dense graphs have more
+    noise. This measures the profile's edges/entity ratio and scales
+    activation_weight accordingly:
+
+    - Sparse (<=1.5 edges/entity): scale to max_weight (0.30) -- trust graph more
+    - Medium (1.5-2.5): use base_weight (0.15)
+    - Dense (>=3.5 edges/entity): scale to min_weight (0.05) -- reduce graph influence
+
+    Directly mitigates cluster saturation on single-chat benchmarks.
+    """
+    density = _profile_graph_density(profile)
+
+    if density <= 1.5:
+        return max_weight
+    if density >= 3.5:
+        return min_weight
+    # Linear interpolation between max_weight @ 1.5 and min_weight @ 3.5
+    # range width = 2.0, distance from sparse end = (density - 1.5)
+    frac = (density - 1.5) / 2.0
+    return max_weight - frac * (max_weight - min_weight)
+
+
+def _merge_activation_results(
+    hybrid_results: list[dict],
+    query_entity_tags: list[str] | None,
+    profile: str,
+    limit: int,
+    graph_fraction: float = 0.3,
+    activation_weight: float | None = None,
+) -> list[dict]:
+    """Merge hybrid search results with spreading activation graph walk.
+
+    Two parallel signals:
+    1. Hybrid search (semantic + keyword) -> relevance score
+    2. Entity graph walk (spreading activation) -> activation score
+
+    When activation_weight is None (default), measures profile graph density
+    and scales weight adaptively (dense profiles get less graph influence).
+    Pass a float to override.
+
+    Memories in both sets get boosted. Graph-only memories (no hybrid match)
+    enter as "bridge" documents at graph_fraction of the result set.
+    """
+    if not query_entity_tags:
+        return hybrid_results[:limit]
+
+    # Global damping knob. Scales both activation_weight (re-ranking magnitude)
+    # and graph_fraction (bridge-doc tail injection). Set 0..1 to soften the
+    # graph layer when the underlying entity graph is dense enough to displace
+    # gold-rank-1 hits. Default 1.0 = current behaviour. damping=0 short-
+    # circuits the spreading-activation RPC entirely (no DB work).
+    damping = float(os.environ.get("OGHAM_ACTIVATION_DAMPING", "1.0"))
+    if damping <= 0.0:
+        return hybrid_results[:limit]
+    if damping != 1.0:
+        graph_fraction = graph_fraction * damping
+
+    # Density-adaptive activation weight (Shodh-inspired).
+    if activation_weight is None:
+        activation_weight = _density_adaptive_activation_weight(profile)
+        logger.debug(
+            "Density-adaptive activation_weight for profile=%s: %.3f",
+            profile,
+            activation_weight,
+        )
+    if damping != 1.0:
+        activation_weight = activation_weight * damping
+
+    try:
+        activated = spread_entity_activation(
+            entity_tags=query_entity_tags,
+            profile=profile,
+            max_depth=2,
+            decay=0.65,
+            min_activation=0.05,
+            max_results=limit * 3,
+        )
+    except Exception:
+        logger.debug("Spreading activation failed, falling back to hybrid only")
+        return hybrid_results[:limit]
+
+    if not activated:
+        return hybrid_results[:limit]
+
+    # Build activation lookup: memory_id -> activation score
+    act_map: dict[str, float] = {}
+    for row in activated:
+        mid = str(row.get("memory_id", ""))
+        act = float(row.get("activation", 0))
+        act_map[mid] = max(act_map.get(mid, 0), act)
+
+    # Squash activation via tanh to prevent runaway MRR-theft from
+    # highly connected clusters. tanh caps influence while preserving
+    # differential signal from bridge entities.
+    import math
+
+    act_map = {k: math.tanh(v) for k, v in act_map.items()}
+
+    # Score hybrid results: relevance + activation_weight * activation
+    hybrid_ids: set[str] = set()
+    for r in hybrid_results:
+        rid = str(r.get("id", ""))
+        hybrid_ids.add(rid)
+        act = act_map.get(rid, 0.0)
+        base = r.get("relevance", 0) or 0
+        r["relevance"] = base + activation_weight * act
+
+    # Re-sort by boosted relevance (re-ranking only — no eviction risk)
+    hybrid_results.sort(key=lambda r: r.get("relevance", 0), reverse=True)
+
+    # Conditional expansion: for cross-reference queries, append a small
+    # number of graph-only candidates at the END (not interleaved).
+    # These are "bridge" documents with zero semantic overlap but strong
+    # entity connections. Appended, not interleaved, so they never displace
+    # the golden semantic result at Rank 1.
+    if graph_fraction > 0 and act_map:
+        from ogham.database import get_memory_by_id
+
+        n_expand = min(3, int(limit * graph_fraction))
+        for mid, act in sorted(act_map.items(), key=lambda x: -x[1]):
+            if mid not in hybrid_ids and n_expand > 0:
+                mem = get_memory_by_id(mid, profile)
+                if mem:
+                    mem["relevance"] = activation_weight * act
+                    mem["_graph_only"] = True
+                    hybrid_results.append(mem)
+                    n_expand -= 1
+
+    return hybrid_results[:limit]
 
 
 def _mmr_rerank(

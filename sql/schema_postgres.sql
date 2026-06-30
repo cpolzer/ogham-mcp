@@ -1,6 +1,9 @@
 -- Ogham MCP Schema (vanilla PostgreSQL / Neon)
 -- Use this for Neon serverless, vanilla PostgreSQL, or any Postgres without Supabase.
 -- No RLS, no anon role — connect directly via psycopg or connection pooler.
+--
+-- memory_lifecycle + triggers + decay params incorporate migrations 025 + 026.
+-- Fresh installs land at post-026 state; upgraders from v0.10.x run ./sql/upgrade.sh.
 
 -- Enable pgvector extension
 create extension if not exists vector with schema public;
@@ -64,9 +67,68 @@ create index if not exists idx_memories_recurrence on memories using gin (recurr
 create table if not exists profile_settings (
     profile text primary key,
     ttl_days integer check (ttl_days is null or ttl_days >= 1),
+    decay_lambda double precision not null default 0.1,
+    decay_beta double precision not null default 0.4,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+-- ── Memory lifecycle (FRESH / STABLE / EDITING) ───────────────────────
+-- Lifecycle state lives in its own table so writes don't trigger HNSW
+-- tuple rewrites on memories.embedding. See migrations 025 + 026 for the
+-- history; fresh installs land directly at the post-026 shape.
+create table if not exists memory_lifecycle (
+    memory_id uuid primary key references memories(id) on delete cascade,
+    profile text not null,
+    stage text not null default 'fresh',
+    stage_entered_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint memory_lifecycle_stage_valid check (stage in ('fresh', 'stable', 'editing'))
+);
+
+-- Partial index for sweeps (advance_stages, close_editing_windows).
+create index if not exists memory_lifecycle_transitioning_idx
+    on memory_lifecycle (profile, stage_entered_at)
+    where stage in ('fresh', 'editing');
+
+-- Full index for lifecycle_pipeline_counts which groups across all stages.
+create index if not exists memory_lifecycle_profile_stage_idx
+    on memory_lifecycle (profile, stage);
+
+-- Trigger: auto-init a lifecycle row when a new memory is inserted.
+create or replace function init_memory_lifecycle() returns trigger as $$
+begin
+    insert into memory_lifecycle (memory_id, profile, stage, stage_entered_at, updated_at)
+    values (new.id, new.profile, 'fresh', new.created_at, new.created_at)
+    on conflict (memory_id) do nothing;
+    return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists memories_init_lifecycle on memories;
+create trigger memories_init_lifecycle
+    after insert on memories
+    for each row
+    execute function init_memory_lifecycle();
+
+-- Trigger: keep memory_lifecycle.profile in sync when a memory is moved
+-- between profiles (rare but possible).
+create or replace function sync_memory_lifecycle_profile() returns trigger as $$
+begin
+    if new.profile is distinct from old.profile then
+        update memory_lifecycle
+           set profile = new.profile, updated_at = now()
+         where memory_id = new.id;
+    end if;
+    return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists memories_sync_lifecycle_profile on memories;
+create trigger memories_sync_lifecycle_profile
+    after update of profile on memories
+    for each row
+    execute function sync_memory_lifecycle_profile();
 
 -- Relationship type enum
 CREATE TYPE relationship_type AS ENUM (
@@ -325,7 +387,10 @@ CREATE OR REPLACE FUNCTION hybrid_search_memories(
     filter_source text DEFAULT NULL,
     full_text_weight float DEFAULT 0.3,
     semantic_weight float DEFAULT 0.7,
-    rrf_k integer DEFAULT 10
+    rrf_k integer DEFAULT 10,
+    filter_profiles text[] DEFAULT NULL,
+    query_entity_tags text[] DEFAULT NULL,
+    recency_decay float DEFAULT 0.0
 )
 RETURNS TABLE(
     id uuid, content text, metadata jsonb, source text, profile text, tags text[],
@@ -339,9 +404,11 @@ AS $function$
 with semantic as (
     select
         m.id,
-        (1 - (m.embedding::halfvec(512) <=> query_embedding::halfvec(512)))::float as similarity
+        (1 - (m.embedding::halfvec(512) <=> query_embedding::halfvec(512)))::float as similarity,
+        row_number() over (order by m.embedding::halfvec(512) <=> query_embedding::halfvec(512)) as rank_ix
     from memories m
-    where m.profile = filter_profile
+    where (filter_profiles is not null and m.profile = any(filter_profiles)
+           or filter_profiles is null and m.profile = filter_profile)
       and (filter_tags is null or m.tags && filter_tags)
       and (filter_source is null or m.source = filter_source)
       and (m.expires_at is null or m.expires_at > now())
@@ -351,9 +418,11 @@ with semantic as (
 keyword as (
     select
         m.id,
-        ts_rank_cd(m.fts, websearch_to_tsquery(query_text))::float as keyword_rank
+        ts_rank_cd(m.fts, websearch_to_tsquery(query_text), 34)::float as keyword_rank,
+        row_number() over (order by ts_rank_cd(m.fts, websearch_to_tsquery(query_text), 34) desc) as rank_ix
     from memories m
-    where m.profile = filter_profile
+    where (filter_profiles is not null and m.profile = any(filter_profiles)
+           or filter_profiles is null and m.profile = filter_profile)
       and m.fts @@ websearch_to_tsquery(query_text)
       and (filter_tags is null or m.tags && filter_tags)
       and (filter_source is null or m.source = filter_source)
@@ -366,9 +435,10 @@ fused as (
         coalesce(s.id, k.id) as id,
         coalesce(s.similarity, 0.0) as similarity,
         coalesce(k.keyword_rank, 0.0) as keyword_rank,
+        -- Reciprocal Rank Fusion: position-based, score-agnostic
         (
-            semantic_weight * coalesce(s.similarity, 0.0)
-            + full_text_weight * coalesce(k.keyword_rank, 0.0)
+            semantic_weight * (1.0 / (rrf_k + coalesce(s.rank_ix, match_count * 3)))
+            + full_text_weight * (1.0 / (rrf_k + coalesce(k.rank_ix, match_count * 3)))
         ) as score
     from semantic s
     full outer join keyword k on s.id = k.id
@@ -378,9 +448,23 @@ select
     f.similarity, f.keyword_rank,
     (
         f.score
+        * m.importance
         * (1.0 + ln(m.access_count + 1.0) * 0.1)
         * m.confidence
         * (1.0 + g.graph_boost * 0.2)
+        -- Entity overlap boost: query-conditioned re-ranking via tag intersection.
+        -- When the query has extractable entities, memories sharing those entities
+        -- get up to 1.3x boost. Bounded, safe, uses existing GIN-indexed tags.
+        -- See docs/plans/2026-04-06-entity-graph-spreading-activation.md Stage 1.
+        * (1.0 + case
+            when query_entity_tags is null or cardinality(query_entity_tags) = 0 then 0.0
+            else (select count(*)::float from unnest(query_entity_tags) qt
+                  where qt = any(m.tags))
+                 / cardinality(query_entity_tags) * 0.4
+          end)
+        -- Gated recency decay: exp(-decay * age_days). Only fires when
+        -- recency_decay > 0 (caller gates by query type). Default 0 = no effect.
+        * exp(-recency_decay * extract(epoch from (now() - m.created_at)) / 86400.0)
     )::float as relevance,
     m.access_count, m.last_accessed_at, m.confidence, m.created_at, m.updated_at
 from fused f
@@ -533,36 +617,84 @@ as $$
 declare
     result jsonb;
 begin
-    select jsonb_build_object(
+    WITH active_memories AS (
+        SELECT id, source, tags, importance, last_accessed_at
+        FROM memories
+        WHERE profile = filter_profile
+          AND (expires_at IS NULL OR expires_at > now())
+    ),
+    related_active_memories AS (
+        SELECT mr.source_id AS memory_id
+        FROM memory_relationships mr
+        JOIN active_memories source_mem ON source_mem.id = mr.source_id
+        JOIN active_memories target_mem ON target_mem.id = mr.target_id
+        WHERE mr.source_id <> mr.target_id
+        UNION
+        SELECT mr.target_id AS memory_id
+        FROM memory_relationships mr
+        JOIN active_memories source_mem ON source_mem.id = mr.source_id
+        JOIN active_memories target_mem ON target_mem.id = mr.target_id
+        WHERE mr.source_id <> mr.target_id
+    ),
+    tag_rows AS (
+        SELECT unnest(tags) AS tag
+        FROM active_memories
+        WHERE tags IS NOT NULL AND cardinality(tags) > 0
+    )
+    SELECT jsonb_build_object(
         'profile', filter_profile,
-        'total', (
-            select count(*) from memories
-            where profile = filter_profile
-              and (expires_at is null or expires_at > now())
-        ),
-        'sources', (
-            select jsonb_object_agg(source, cnt)
-            from (
-                select coalesce(source, 'unknown') as source, count(*) as cnt
-                from memories
-                where profile = filter_profile
-                  and (expires_at is null or expires_at > now())
-                group by source
+        'total', (SELECT count(*) FROM active_memories),
+        'sources', COALESCE((
+            SELECT jsonb_object_agg(source, cnt)
+            FROM (
+                SELECT coalesce(source, 'unknown') AS source, count(*) AS cnt
+                FROM active_memories
+                GROUP BY coalesce(source, 'unknown')
             ) s
-        ),
-        'top_tags', (
-            select jsonb_agg(jsonb_build_object('tag', tag, 'count', cnt))
-            from (
-                select tag, count(*) as cnt
-                from memories, unnest(tags) as tag
-                where profile = filter_profile
-                  and (expires_at is null or expires_at > now())
-                group by tag
-                order by cnt desc
-                limit 20
+        ), '{}'::jsonb),
+        'top_tags', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('tag', tag, 'count', cnt))
+            FROM (
+                SELECT tag, count(*) AS cnt
+                FROM tag_rows
+                GROUP BY tag
+                ORDER BY cnt DESC, tag
+                LIMIT 20
             ) t
+        ), '[]'::jsonb),
+        'relationships', jsonb_build_object(
+            'orphan_count', (
+                SELECT count(*)
+                FROM active_memories m
+                LEFT JOIN related_active_memories ram ON ram.memory_id = m.id
+                WHERE ram.memory_id IS NULL
+            )
+        ),
+        'tagging', jsonb_build_object(
+            'untagged_count', (
+                SELECT count(*)
+                FROM active_memories
+                WHERE tags IS NULL OR cardinality(tags) = 0
+            ),
+            'distinct_tag_count', (SELECT count(DISTINCT tag) FROM tag_rows)
+        ),
+        'decay', jsonb_build_object(
+            'eligible_count', (
+                SELECT count(*)
+                FROM active_memories
+                WHERE importance > 0.05
+                  AND (
+                      last_accessed_at IS NULL
+                      OR last_accessed_at < now() - interval '7 days'
+                  )
+            ),
+            'floor_count', (
+                SELECT count(*)
+                FROM active_memories
+                WHERE importance <= 0.05
+            )
         )
-    ) into result;
+    ) INTO result;
 
     return result;
 end;
@@ -705,3 +837,185 @@ BEGIN
     LIMIT result_limit;
 END;
 $$;
+
+-- ── Hebbian decay + potentiation ───────────────────────────────────────
+-- Memories not accessed within 7 days decay in importance.
+-- Potentiated memories (access_count >= 10) decay much slower (LTP).
+-- Floor at 0.05: keeps memories in the "unconscious" but retrievable.
+-- Run as a batch job (cron, CLI, or MCP tool) -- not on-access.
+
+CREATE OR REPLACE FUNCTION apply_hebbian_decay(
+    target_profile text,
+    batch_size int DEFAULT 1000
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public
+AS $$
+DECLARE
+    rows_affected integer;
+BEGIN
+    WITH decay_targets AS (
+        SELECT id FROM memories
+        WHERE profile = target_profile
+          AND importance > 0.05
+          AND (expires_at IS NULL OR expires_at > now())
+          AND (last_accessed_at IS NULL
+               OR last_accessed_at < now() - interval '7 days')
+        LIMIT batch_size
+    )
+    UPDATE memories
+    SET importance = greatest(0.05,
+        importance * power(
+            CASE WHEN access_count >= 10 THEN 0.99 ELSE 0.95 END,
+            extract(epoch from (now() - coalesce(last_accessed_at, created_at))) / 2592000.0
+        )
+    )
+    WHERE id IN (SELECT id FROM decay_targets);
+
+    GET DIAGNOSTICS rows_affected = ROW_COUNT;
+    RETURN rows_affected;
+END;
+$$;
+
+-- ── Audit log (append-only event trail) ────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_time timestamptz NOT NULL DEFAULT now(),
+    profile text NOT NULL,
+    operation text NOT NULL,              -- store | search | delete | update | re_embed
+    resource_id uuid,                     -- memories.id if applicable
+    outcome text NOT NULL DEFAULT 'success',
+    source text,                          -- claude-code | cursor | gateway | cli
+    embedding_model text,
+    tokens_used integer,
+    cost_usd numeric(10,6),
+    result_ids uuid[],                    -- memory IDs returned by search
+    result_count integer,
+    query_hash text,                      -- sha256 of query text (not the query itself)
+    metadata jsonb DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_profile_time
+    ON audit_log (profile, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_resource
+    ON audit_log (resource_id) WHERE resource_id IS NOT NULL;
+
+-- ── Entity graph (spreading activation substrate) ─────────────────────
+
+CREATE TABLE IF NOT EXISTS entities (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    canonical_name text NOT NULL,
+    entity_type text NOT NULL,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    mention_count integer NOT NULL DEFAULT 0,
+    temporal_span float NOT NULL DEFAULT 1.0,
+    session_count integer NOT NULL DEFAULT 1,
+    UNIQUE (canonical_name, entity_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_type_name
+    ON entities (entity_type, canonical_name);
+CREATE INDEX IF NOT EXISTS idx_entities_canonical_type
+    ON entities (canonical_name, entity_type);
+
+CREATE TABLE IF NOT EXISTS memory_entities (
+    memory_id uuid NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    entity_id bigint NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    profile text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (memory_id, entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_entities_memory
+    ON memory_entities (memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_entities_entity_profile
+    ON memory_entities (entity_id, profile);
+
+-- Refresh temporal span for a single entity
+CREATE OR REPLACE FUNCTION refresh_entity_temporal_span(target_entity_id bigint)
+RETURNS void LANGUAGE sql AS $$
+    UPDATE entities SET
+        session_count = sub.cnt,
+        temporal_span = ln(1.0 + sub.cnt)
+    FROM (
+        SELECT COUNT(DISTINCT DATE_TRUNC('day', m.created_at)) AS cnt
+        FROM memory_entities me
+        JOIN memories m ON m.id = me.memory_id
+        WHERE me.entity_id = target_entity_id
+    ) sub
+    WHERE id = target_entity_id;
+$$;
+
+-- Spreading activation over the bipartite entity/memory graph
+CREATE OR REPLACE FUNCTION spread_entity_activation_memories(
+    seed_entity_tags text[],
+    filter_profile text,
+    max_depth int DEFAULT 2,
+    decay float DEFAULT 0.65,
+    min_activation float DEFAULT 0.1,
+    max_results int DEFAULT 50
+) RETURNS TABLE (memory_id uuid, activation float)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    RETURN QUERY
+    WITH RECURSIVE
+    seeds AS (
+        SELECT DISTINCT e.id, e.temporal_span
+        FROM entities e
+        JOIN LATERAL unnest(seed_entity_tags) AS t ON true
+        WHERE e.canonical_name = split_part(t, ':', 2)
+          AND e.entity_type = split_part(t, ':', 1)
+        LIMIT 6
+    ),
+    walk AS (
+        SELECT s.id AS entity_id, 1.0::float AS activation, 0 AS depth
+        FROM seeds s
+        UNION ALL
+        SELECT e2.id AS entity_id,
+               LEAST(1.0,
+                 w.activation * decay
+                 * LEAST(e2.temporal_span, 3.0)
+                 * (1.0 / ln(1.0 + GREATEST(e2.mention_count, 1)))
+               )::float AS activation,
+               w.depth + 1 AS depth
+        FROM walk w
+        JOIN memory_entities me1 ON me1.entity_id = w.entity_id
+                                AND me1.profile = filter_profile
+        JOIN memory_entities me2 ON me2.memory_id = me1.memory_id
+                                AND me2.entity_id != w.entity_id
+                                AND me2.profile = filter_profile
+        JOIN entities e2 ON e2.id = me2.entity_id
+        WHERE w.depth < max_depth
+          AND w.activation * decay
+              * LEAST(e2.temporal_span, 3.0)
+              * (1.0 / ln(1.0 + GREATEST(e2.mention_count, 1)))
+              > min_activation
+    ),
+    activated_entities AS (
+        SELECT w2.entity_id, max(w2.activation) AS activation
+        FROM walk w2
+        GROUP BY w2.entity_id
+    ),
+    activated_memories AS (
+        SELECT me.memory_id, max(ae.activation) AS activation
+        FROM activated_entities ae
+        JOIN memory_entities me ON me.entity_id = ae.entity_id
+                               AND me.profile = filter_profile
+        GROUP BY me.memory_id
+    )
+    SELECT am.memory_id, am.activation
+    FROM activated_memories am
+    ORDER BY am.activation DESC
+    LIMIT max_results;
+END;
+$$;
+
+-- v0.14: lock down entity-graph SECURITY DEFINER functions to service_role
+-- only (no anon / authenticated REST exposure). Migration 037 mirrors
+-- this for existing deployments. See migration 037 header for full
+-- rationale.
+REVOKE EXECUTE ON FUNCTION refresh_entity_temporal_span(bigint) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION spread_entity_activation_memories(text[], text, integer, double precision, double precision, integer) FROM PUBLIC;

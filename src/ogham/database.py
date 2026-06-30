@@ -7,11 +7,38 @@ based on ``settings.database_backend`` (defaults to ``"supabase"``).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
+
+from ogham.backends.protocol import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
-_backend = None
+_backend: DatabaseBackend | None = None
+
+
+def set_tenant_context(tenant_id: str | None) -> None:
+    """Set the tenant ID for subsequent DB operations on this task / thread.
+
+    Multi-tenant deployments (e.g. the Ogham gateway) call this in their
+    request middleware after authenticating the caller. Self-hosted users
+    do not need to call this -- the default `None` is a no-op.
+
+    Currently only the PostgresBackend honours this contextvar. The Supabase
+    backend (PostgREST-based) is for self-hosted single-tenant use and does
+    not need or use it. If a multi-tenant deployment ever wants to use the
+    Supabase backend, it would need its own JWT-based scoping mechanism.
+    """
+    # Lazy import to avoid loading psycopg in self-hosted Supabase setups.
+    from ogham.backends.postgres import set_tenant_context as _set
+
+    _set(tenant_id)
+
+
+def get_tenant_context() -> str | None:
+    """Return the currently set tenant ID, or None."""
+    from ogham.backends.postgres import get_tenant_context as _get
+
+    return _get()
 
 
 def _reset_backend() -> None:
@@ -20,7 +47,7 @@ def _reset_backend() -> None:
     _backend = None
 
 
-def get_backend():
+def get_backend() -> DatabaseBackend:
     """Return (and lazily create) the singleton backend instance."""
     global _backend
     if _backend is None:
@@ -50,7 +77,7 @@ def get_client():
     backend = get_backend()
     if not hasattr(backend, "_get_client"):
         raise RuntimeError(f"Backend {type(backend).__name__!r} does not expose a raw client")
-    return backend._get_client()
+    return cast(Any, backend)._get_client()
 
 
 # ── Thin delegates — one per public function ────────────────────────────
@@ -90,6 +117,11 @@ def store_memories_batch(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return get_backend().store_memories_batch(rows)
 
 
+def upsert_memory(memory: dict[str, Any]) -> dict[str, Any]:
+    """INSERT or UPDATE a memory keyed by ``id``. Delegates to the active backend."""
+    return get_backend().upsert_memory(memory)
+
+
 def search_memories(
     query_embedding: list[float],
     profile: str,
@@ -116,9 +148,20 @@ def hybrid_search_memories(
     limit: int | None = None,
     tags: list[str] | None = None,
     source: str | None = None,
+    profiles: list[str] | None = None,
+    query_entity_tags: list[str] | None = None,
+    recency_decay: float = 0.0,
 ) -> list[dict[str, Any]]:
     return get_backend().hybrid_search_memories(
-        query_text, query_embedding, profile, limit, tags, source
+        query_text,
+        query_embedding,
+        profile,
+        limit,
+        tags,
+        source,
+        profiles,
+        query_entity_tags=query_entity_tags,
+        recency_decay=recency_decay,
     )
 
 
@@ -212,6 +255,47 @@ def count_expired(profile: str) -> int:
     return get_backend().count_expired(profile)
 
 
+def apply_hebbian_decay(profile: str, batch_size: int = 1000) -> int:
+    return get_backend().apply_hebbian_decay(profile, batch_size)
+
+
+def count_decay_eligible(profile: str) -> int:
+    return get_backend().count_decay_eligible(profile)
+
+
+def emit_audit_event(**kwargs: Any) -> None:
+    backend = cast(Any, get_backend())
+    backend.emit_audit_event(**kwargs)
+
+
+def query_audit_log(
+    profile: str, limit: int = 50, operation: str | None = None
+) -> list[dict[str, Any]]:
+    return get_backend().query_audit_log(profile, limit, operation)
+
+
+def spread_entity_activation(
+    entity_tags: list[str],
+    profile: str,
+    max_depth: int = 2,
+    decay: float = 0.65,
+    min_activation: float = 0.05,
+    max_results: int = 50,
+) -> list[dict[str, Any]]:
+    backend = cast(Any, get_backend())
+    return cast(
+        list[dict[str, Any]],
+        backend.spread_entity_activation(
+            entity_tags,
+            profile,
+            max_depth,
+            decay,
+            min_activation,
+            max_results,
+        ),
+    )
+
+
 def auto_link_memory(
     memory_id: str,
     embedding: list[float],
@@ -268,4 +352,58 @@ def get_related_memories(
 ) -> list[dict[str, Any]]:
     return get_backend().get_related_memories(
         memory_id, depth, min_strength, relationship_types, limit
+    )
+
+
+def gap_out_of_result_contradictions(
+    profile: str, memory_ids: list[str], *, sample_size: int = 10
+) -> dict[str, Any]:
+    """Contradiction edges where one endpoint is in memory_ids and the other is outside it.
+
+    Returns {"count": int, "pairs": [{"in_result_id": .., "other_id": .., "strength": ..}]}.
+    Dispatches to gap_contradictions_for_ids SQL function (migration 039).
+    """
+    return cast(Any, get_backend()).gap_out_of_result_contradictions(
+        profile, memory_ids, sample_size=sample_size
+    )
+
+
+def walk_memory_graph(
+    start_id: str,
+    depth: int = 1,
+    direction: str = "both",
+    min_strength: float = 0.0,
+    relationship_types: list[str] | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Direction-aware graph walk from a known memory id.
+
+    Thin facade over backend.wiki_walk_graph (migration 031 function
+    `wiki_walk_graph`). PostgresBackend dispatches via psycopg;
+    SupabaseBackend via PostgREST rpc(). Direction validation +
+    depth bounds checked client-side here so callers get a clean
+    error before the round-trip; the SQL function also enforces.
+
+      * 'outgoing' -- edges where memory_id is source (this -> other)
+      * 'incoming' -- edges where memory_id is target (other -> this)
+      * 'both' -- traditional bidirectional traversal
+    """
+    if direction not in ("outgoing", "incoming", "both"):
+        raise ValueError(f"direction must be 'outgoing', 'incoming', or 'both'; got {direction!r}")
+    if depth < 0:
+        raise ValueError("depth must be >= 0")
+    if depth > 5:
+        raise ValueError("depth must be <= 5; use explore_knowledge for broader walks")
+
+    backend = cast(Any, get_backend())
+    return cast(
+        list[dict[str, Any]],
+        backend.wiki_walk_graph(
+            start_id=start_id,
+            max_depth=depth,
+            direction=direction,
+            min_strength=min_strength,
+            relationship_types=relationship_types,
+            result_limit=limit,
+        ),
     )

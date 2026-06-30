@@ -8,17 +8,35 @@ FAKE_ID = "a1b2c3d4-0000-0000-0000-000000000001"
 
 @pytest.fixture(autouse=True)
 def mock_settings(monkeypatch):
+    from ogham.flow_control import clear_flow_overrides
+
+    clear_flow_overrides()
     monkeypatch.setenv("SUPABASE_URL", "https://fake.supabase.co")
     monkeypatch.setenv("SUPABASE_KEY", "fake-key")
     monkeypatch.setenv("EMBEDDING_PROVIDER", "ollama")
     monkeypatch.setenv("DEFAULT_PROFILE", "default")
+    # Tests assume the resolution order falls through to settings.default_profile
+    # = "default". The OGHAM_PROFILE env var would short-circuit that.
+    monkeypatch.delenv("OGHAM_PROFILE", raising=False)
+    yield
+    clear_flow_overrides()
 
 
 @pytest.fixture(autouse=True)
-def reset_profile():
-    """Reset profile to default between tests."""
+def reset_profile(monkeypatch):
+    """Reset profile to default between tests.
+
+    get_active_profile() reads four sources in order:
+      OGHAM_PROFILE env > ~/.ogham/active_profile sentinel > in-memory > settings
+    Tests want the in-memory branch to win, so we both reset the in-memory
+    flag AND stub the sentinel file reader (so Kevin's actual ~/.ogham
+    state, which says "work", doesn't bleed into tests). settings is also
+    pinned to "default" because it can drift with config.env.
+    """
     import ogham.tools.memory as mem
 
+    monkeypatch.setattr(mem, "_read_active_profile_sentinel", lambda: None)
+    monkeypatch.setattr("ogham.config.settings.default_profile", "default")
     mem._active_profile = "default"
     yield
     mem._active_profile = "default"
@@ -28,6 +46,7 @@ def reset_profile():
 def mock_embedding():
     with (
         patch("ogham.tools.memory.generate_embedding") as mock,
+        patch("ogham.embeddings.generate_embedding", mock),
         patch("ogham.service.generate_embedding", mock),
     ):
         mock.return_value = [0.1] * 1024
@@ -36,15 +55,28 @@ def mock_embedding():
 
 @pytest.fixture
 def mock_db():
+    # delete/update/reinforce/contradict pre-fetch tags via get_memory_by_id
+    # (the backend facade) before mutating. The pre-fetch needs a fixture
+    # answer; otherwise the tools crash on get_memory_by_id returning None.
+    # Patch targets follow the actual import locations:
+    #   - get_memory_by_id, emit_audit_event: imported inline from ogham.database,
+    #     so the module-level name to patch is `ogham.database.<name>`.
+    #   - enqueue_for_tags: imported inline from ogham.recompute_executor.
+    #   - db_update_confidence: imported at the top of tools/memory.py.
     with (
         patch("ogham.service.db_store") as store,
         patch("ogham.service.hybrid_search_memories") as search,
         patch("ogham.service.record_access") as rec_access,
+        patch("ogham.tools.memory.record_access", new=rec_access),
         patch("ogham.service.db_get_profile_ttl") as get_ttl,
         patch("ogham.service.db_auto_link") as auto_link,
         patch("ogham.tools.memory.list_recent_memories") as list_recent,
         patch("ogham.tools.memory.db_delete") as delete,
         patch("ogham.tools.memory.db_update") as update,
+        patch("ogham.database.get_memory_by_id") as get_by_id,
+        patch("ogham.database.emit_audit_event"),
+        patch("ogham.recompute_executor.enqueue_for_tags") as enqueue,
+        patch("ogham.tools.memory.db_update_confidence") as update_conf,
     ):
         store.return_value = {
             "id": FAKE_ID,
@@ -81,6 +113,8 @@ def mock_db():
         }
         get_ttl.return_value = None
         auto_link.return_value = 0
+        get_by_id.return_value = {"id": FAKE_ID, "tags": [], "profile": "default"}
+        update_conf.return_value = 0.85
         yield {
             "store": store,
             "search": search,
@@ -90,6 +124,9 @@ def mock_db():
             "get_ttl": get_ttl,
             "record_access": rec_access,
             "auto_link": auto_link,
+            "get_by_id": get_by_id,
+            "enqueue": enqueue,
+            "update_conf": update_conf,
         }
 
 
@@ -145,10 +182,30 @@ def test_store_memory_uses_active_profile(mock_embedding, mock_db):
     assert call_kwargs["profile"] == "personal"
 
 
+def test_store_memory_disabled_does_not_store_or_enqueue(mock_embedding, mock_db):
+    from ogham.flow_control import temporary_flow_overrides
+    from ogham.tools.memory import store_memory
+
+    with temporary_flow_overrides(inscribe=False):
+        result = store_memory(content="test memory", source="test", tags=["tag1"])
+
+    assert result["status"] == "disabled"
+    assert result["flow"] == "inscribe"
+    mock_embedding.assert_not_called()
+    mock_db["store"].assert_not_called()
+    mock_db["enqueue"].assert_not_called()
+
+
 def test_hybrid_search(mock_embedding, mock_db):
+    """v0.12.1 split shape: hybrid_search returns dict with results +
+    wiki_preamble keys. wiki_preamble defaults to [] when injection is
+    off (which it is here, since the fixture doesn't enable it)."""
     from ogham.tools.memory import hybrid_search
 
-    results = hybrid_search(query="test query")
+    out = hybrid_search(query="test query")
+    assert isinstance(out, dict)
+    results = out["results"]
+    assert out["wiki_preamble"] == []
     assert len(results) == 1
     assert results[0]["similarity"] == 0.95
     assert results[0]["keyword_rank"] == 0.3
@@ -159,6 +216,22 @@ def test_hybrid_search(mock_embedding, mock_db):
     assert call_kwargs["query_text"] == "test query"
     assert call_kwargs["profile"] == "default"
     mock_db["record_access"].assert_called_once_with([FAKE_ID])
+
+
+def test_hybrid_search_disabled_does_not_recall(mock_embedding, mock_db):
+    from ogham.flow_control import temporary_flow_overrides
+    from ogham.tools.memory import hybrid_search
+
+    with temporary_flow_overrides(recall=False):
+        out = hybrid_search(query="test query")
+
+    assert out["status"] == "disabled"
+    assert out["flow"] == "recall"
+    assert out["results"] == []
+    assert out["wiki_preamble"] == []
+    mock_embedding.assert_not_called()
+    mock_db["search"].assert_not_called()
+    mock_db["record_access"].assert_not_called()
 
 
 def test_list_recent(mock_embedding, mock_db):
@@ -467,6 +540,7 @@ def test_check_database_failure():
 
         assert result["status"] == "error"
         assert result["connected"] is False
+        assert isinstance(result["error"], str)
         assert "Connection refused" in result["error"]
 
 
@@ -530,6 +604,7 @@ def test_check_embedding_provider_openai_no_key():
         result = check_embedding_provider()
 
         assert result["status"] == "error"
+        assert isinstance(result["error"], str)
         assert "OPENAI_API_KEY not set" in result["error"]
 
 
@@ -560,6 +635,7 @@ def test_check_config_missing_url():
         result = check_config()
 
         assert result["status"] == "warning"
+        assert isinstance(result["issues"], list)
         assert "SUPABASE_URL not set" in result["issues"]
 
 
@@ -575,6 +651,7 @@ def test_check_config_unusual_embedding_dim():
         result = check_config()
 
         assert result["status"] == "warning"
+        assert isinstance(result["issues"], list)
         assert any("Unusual embedding_dim" in issue for issue in result["issues"])
 
 
@@ -629,7 +706,7 @@ def test_cache_respects_max_size(tmp_path):
 
     try:
         with patch("ogham.embeddings._generate_uncached") as mock_gen:
-            mock_gen.side_effect = lambda t: [float(hash(t) % 100)] * 1024
+            mock_gen.side_effect = lambda t, usage_out=None: [float(hash(t) % 100)] * 1024
 
             generate_embedding("first")
             generate_embedding("second")
@@ -655,7 +732,7 @@ def test_cache_eviction_counter(tmp_path):
 
     try:
         with patch("ogham.embeddings._generate_uncached") as mock_gen:
-            mock_gen.side_effect = lambda t: [float(hash(t) % 100)] * 1024
+            mock_gen.side_effect = lambda t, usage_out=None: [float(hash(t) % 100)] * 1024
 
             generate_embedding("first")
             generate_embedding("second")
@@ -1217,6 +1294,30 @@ def test_store_decision_with_related_memories(mock_embedding, mock_db):
         created_by="user",
         metadata={},
     )
+
+
+def test_store_decision_disabled_with_related_memories_does_not_create_edges(
+    mock_embedding, mock_db
+):
+    """Disabled inscribe should short-circuit before supports edges use result['id']."""
+    from ogham.flow_control import temporary_flow_overrides
+    from ogham.tools.memory import store_decision
+
+    related_id = "b2c3d4e5-0000-0000-0000-000000000002"
+
+    with temporary_flow_overrides(inscribe=False):
+        with patch("ogham.tools.memory.db_create_relationship") as mock_rel:
+            result = store_decision(
+                decision="Use RRF for hybrid search",
+                rationale="No score normalization needed",
+                related_memories=[related_id],
+            )
+
+    assert result["status"] == "disabled"
+    assert result["flow"] == "inscribe"
+    mock_embedding.assert_not_called()
+    mock_db["store"].assert_not_called()
+    mock_rel.assert_not_called()
 
 
 # --- get_related_memories database tests ---

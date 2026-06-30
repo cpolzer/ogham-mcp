@@ -23,6 +23,8 @@ class DatabaseBackend(Protocol):
         source: str | None = None,
         tags: list[str] | None = None,
         expires_at: str | None = None,
+        importance: float = 0.5,
+        surprise: float = 0.5,
         recurrence_days: list[int] | None = None,
     ) -> dict[str, Any]: ...
 
@@ -30,6 +32,24 @@ class DatabaseBackend(Protocol):
         self,
         rows: list[dict[str, Any]],
     ) -> list[dict[str, Any]]: ...
+
+    def upsert_memory(
+        self,
+        memory: dict[str, Any],
+    ) -> dict[str, Any]:
+        """INSERT or UPDATE a memory keyed by ``id``.
+
+        Used by OKF imports to support round-trip semantics: if a memory with
+        the given UUID already exists it is updated (content, tags, metadata,
+        embedding, source, updated_at are overwritten); access_count,
+        last_accessed_at, and created_at are PRESERVED -- they are runtime
+        state that should not be clobbered on a re-import.
+
+        ``memory`` must have an ``"id"`` key and an ``"embedding"`` key (the
+        caller is responsible for generating the embedding before calling this).
+        Other recognised keys match the ``store_memory`` signature.
+        """
+        ...
 
     def update_memory(
         self,
@@ -70,6 +90,9 @@ class DatabaseBackend(Protocol):
         limit: int | None = None,
         tags: list[str] | None = None,
         source: str | None = None,
+        profiles: list[str] | None = None,
+        query_entity_tags: list[str] | None = None,
+        recency_decay: float = 0.0,
     ) -> list[dict[str, Any]]: ...
 
     def list_recent_memories(
@@ -197,4 +220,104 @@ class DatabaseBackend(Protocol):
         min_strength: float = 0.5,
         relationship_types: list[str] | None = None,
         limit: int = 20,
+    ) -> list[dict[str, Any]]: ...
+
+    # ── Hebbian Decay ─────────────────────────────────────────────────
+
+    def apply_hebbian_decay(self, profile: str, batch_size: int = 1000) -> int: ...
+    def count_decay_eligible(self, profile: str) -> int: ...
+
+    # ── Lifecycle (v0.13.1 — migration 035 RPC parity) ────────────────
+
+    def lifecycle_advance_stages(
+        self,
+        profile: str,
+        cutoff_iso: str,
+        surprise_gate: float,
+        importance_gate: float,
+    ) -> int: ...
+
+    def lifecycle_close_editing_windows(
+        self,
+        profile: str,
+        cutoff_iso: str,
+    ) -> int: ...
+
+    def lifecycle_open_editing_window(
+        self,
+        memory_ids: list[str],
+    ) -> None: ...
+
+    def lifecycle_pipeline_counts(
+        self,
+        profile: str,
+    ) -> dict[str, int]: ...
+
+    # ── Hebbian co-retrieval edges (v0.13.1) ──────────────────────────
+
+    def hebbian_strengthen_edges(
+        self,
+        sources: list[str],
+        targets: list[str],
+        bootstrap: float,
+        rate: float,
+    ) -> int: ...
+
+    # ── Entity graph density signal (v0.13.1) ─────────────────────────
+
+    def entity_graph_density(
+        self,
+        profile: str,
+    ) -> tuple[float, float]: ...
+
+    """Returns (entity_count, edge_count) -- both as floats so callers can
+    compute density = edges / entities without re-casting."""
+
+    # ── Entity graph writes (v0.14) ───────────────────────────────────
+
+    def link_memory_entities(
+        self,
+        memory_id: str,
+        profile: str,
+        entity_tags: list[str],
+    ) -> int: ...
+
+    """Upsert entities and link to a memory. ``entity_tags`` are
+    ``"type:name"`` strings from ``ogham.extraction.extract_entities``.
+    Returns the number of new (memory, entity) edges inserted (0 on a
+    re-run since memory_entities has a unique constraint)."""
+
+    # ── Hidden-link suggestions (v0.13.1) ─────────────────────────────
+
+    def suggest_unlinked_by_shared_entities(
+        self,
+        memory_id: str,
+        profile: str,
+        min_shared: int,
+        limit: int,
+    ) -> list[dict[str, Any]]: ...
+
+    # ── Audit ────────────────────────────────────────────────────────
+
+    def emit_audit_event(
+        self,
+        profile: str,
+        operation: str,
+        resource_id: str | None = None,
+        outcome: str = "success",
+        source: str | None = None,
+        embedding_model: str | None = None,
+        tokens_used: int | None = None,
+        cost_usd: float | None = None,
+        result_ids: list[str] | None = None,
+        result_count: int | None = None,
+        query_hash: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    def query_audit_log(
+        self,
+        profile: str,
+        limit: int = 50,
+        operation: str | None = None,
     ) -> list[dict[str, Any]]: ...

@@ -1,5 +1,8 @@
 -- Ogham MCP Schema
 -- Run this in the Supabase SQL Editor
+--
+-- memory_lifecycle + triggers + decay params incorporate migrations 025 + 026.
+-- Fresh installs land at post-026 state; upgraders from v0.10.x run ./sql/upgrade.sh.
 
 -- Enable pgvector extension
 create extension if not exists vector with schema extensions;
@@ -25,6 +28,9 @@ create table if not exists memories (
     original_content text,
     occurrence_period tstzrange,
     recurrence_days int[],
+    -- Multi-tenant: NULL for self-hosted single-tenant deployments,
+    -- set by the gateway via SET LOCAL app.tenant_id for cloud requests.
+    tenant_id uuid,
     fts tsvector generated always as (to_tsvector('english', content)) stored
 );
 
@@ -41,8 +47,49 @@ alter table memories force row level security;
 create policy "Deny anon access" on memories
     for all to anon using (false) with check (false);
 
--- No authenticated policy: service_role bypasses RLS.
--- Add scoped policies here when building multi-user support.
+-- Helper: returns the current tenant_id from session config, or NULL.
+-- Wrapping in a STABLE function with EXCEPTION handling avoids the
+-- "invalid input syntax for type uuid" error that happens when Postgres
+-- evaluates an OR clause's cast on an empty session variable instead of
+-- short-circuiting on the IS NULL / = '' check. STABLE means Postgres
+-- evaluates it once per query, not once per row -- critical for query
+-- performance under RLS.
+--
+-- SET search_path = pg_catalog is the Postgres-level mitigation for the
+-- search-path-shadowing class of vulnerability (Supabase linter rule
+-- 0011 function_search_path_mutable). Without this, a hostile user
+-- with CREATE on a schema in their search_path could shadow
+-- current_setting / nullif / the uuid cast and intercept the function
+-- on every RLS check. All three primitives live in pg_catalog so we
+-- pin to that only -- nothing from public is needed.
+create or replace function current_tenant_id() returns uuid
+    language plpgsql stable
+    set search_path = pg_catalog
+    as $$
+begin
+    return nullif(current_setting('app.tenant_id', true), '')::uuid;
+exception
+    when others then
+        return null;
+end;
+$$;
+
+-- Tenant-scoped access (gateway / multi-tenant):
+-- - When current_tenant_id() is NULL (self-hosted, CLI, migrations,
+--   no contextvar set) the policy returns all rows -- single-tenant fallback.
+-- - When set (gateway requests) the policy filters to that tenant_id.
+-- Variable name app.tenant_id is shared with the embedding_cache RLS
+-- introduced in Phase 1 (2026-03-16). Service role bypasses both.
+create policy "Tenant scoped access" on memories
+    for all
+    using (
+        current_tenant_id() is null
+        or tenant_id = current_tenant_id()
+    )
+    with check (
+        current_tenant_id() is null
+        or tenant_id = current_tenant_id()
+    );
 
 -- HNSW index for fast cosine similarity search
 create index if not exists memories_embedding_idx
@@ -74,6 +121,8 @@ create index if not exists idx_memories_recurrence on memories using gin (recurr
 create table if not exists profile_settings (
     profile text primary key,
     ttl_days integer check (ttl_days is null or ttl_days >= 1),
+    decay_lambda double precision not null default 0.1,
+    decay_beta double precision not null default 0.4,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -87,6 +136,73 @@ create policy "Deny anon access" on profile_settings
 
 -- No authenticated policy: service_role bypasses RLS.
 -- Add scoped policies here when building multi-user support.
+
+-- ── Memory lifecycle (FRESH / STABLE / EDITING) ───────────────────────
+-- Lifecycle state lives in its own table so writes don't trigger HNSW
+-- tuple rewrites on memories.embedding. See migrations 025 + 026 for the
+-- history; fresh installs land directly at the post-026 shape.
+create table if not exists memory_lifecycle (
+    memory_id uuid primary key references memories(id) on delete cascade,
+    profile text not null,
+    stage text not null default 'fresh',
+    stage_entered_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint memory_lifecycle_stage_valid check (stage in ('fresh', 'stable', 'editing'))
+);
+
+-- Partial index for sweeps (advance_stages, close_editing_windows).
+create index if not exists memory_lifecycle_transitioning_idx
+    on memory_lifecycle (profile, stage_entered_at)
+    where stage in ('fresh', 'editing');
+
+-- Full index for lifecycle_pipeline_counts which groups across all stages.
+create index if not exists memory_lifecycle_profile_stage_idx
+    on memory_lifecycle (profile, stage);
+
+-- RLS for memory_lifecycle: mirror the "Deny anon access" pattern.
+-- service_role bypasses RLS. Tenant scoping is enforced via joins to
+-- memories (lifecycle rows have no tenant_id column of their own --
+-- they're 1:1 with memories and follow that table's tenancy).
+alter table memory_lifecycle enable row level security;
+alter table memory_lifecycle force row level security;
+
+create policy "Deny anon access" on memory_lifecycle
+    for all to anon using (false) with check (false);
+
+-- Trigger: auto-init a lifecycle row when a new memory is inserted.
+create or replace function init_memory_lifecycle() returns trigger as $$
+begin
+    insert into memory_lifecycle (memory_id, profile, stage, stage_entered_at, updated_at)
+    values (new.id, new.profile, 'fresh', new.created_at, new.created_at)
+    on conflict (memory_id) do nothing;
+    return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists memories_init_lifecycle on memories;
+create trigger memories_init_lifecycle
+    after insert on memories
+    for each row
+    execute function init_memory_lifecycle();
+
+-- Trigger: keep memory_lifecycle.profile in sync when a memory is moved
+-- between profiles (rare but possible).
+create or replace function sync_memory_lifecycle_profile() returns trigger as $$
+begin
+    if new.profile is distinct from old.profile then
+        update memory_lifecycle
+           set profile = new.profile, updated_at = now()
+         where memory_id = new.id;
+    end if;
+    return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists memories_sync_lifecycle_profile on memories;
+create trigger memories_sync_lifecycle_profile
+    after update of profile on memories
+    for each row
+    execute function sync_memory_lifecycle_profile();
 
 -- Relationship type enum
 CREATE TYPE relationship_type AS ENUM (
@@ -108,6 +224,9 @@ CREATE TABLE memory_relationships (
     metadata jsonb DEFAULT '{}'::jsonb,
     created_by text NOT NULL DEFAULT 'auto',
     created_at timestamptz NOT NULL DEFAULT now(),
+    -- Multi-tenant: denormalised from memories.tenant_id for query
+    -- performance (RLS policy can filter without joining to memories).
+    tenant_id uuid,
     CONSTRAINT unique_relationship UNIQUE (source_id, target_id, relationship)
 );
 
@@ -117,6 +236,18 @@ ALTER TABLE memory_relationships FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY "Deny anon access" ON memory_relationships
     FOR ALL TO anon USING (false) WITH CHECK (false);
+
+-- Tenant-scoped access (uses the same current_tenant_id() helper as memories)
+CREATE POLICY "Tenant scoped access" ON memory_relationships
+    FOR ALL
+    USING (
+        current_tenant_id() IS NULL
+        OR tenant_id = current_tenant_id()
+    )
+    WITH CHECK (
+        current_tenant_id() IS NULL
+        OR tenant_id = current_tenant_id()
+    );
 
 -- Indexes: FK columns with composite for common query patterns
 CREATE INDEX idx_relationships_source
@@ -352,7 +483,10 @@ CREATE OR REPLACE FUNCTION hybrid_search_memories(
     filter_source text DEFAULT NULL,
     full_text_weight float DEFAULT 0.3,
     semantic_weight float DEFAULT 0.7,
-    rrf_k integer DEFAULT 10
+    rrf_k integer DEFAULT 10,
+    filter_profiles text[] DEFAULT NULL,
+    query_entity_tags text[] DEFAULT NULL,
+    recency_decay float DEFAULT 0.0
 )
 RETURNS TABLE(
     id uuid, content text, metadata jsonb, source text, profile text, tags text[],
@@ -366,9 +500,11 @@ AS $function$
 with semantic as (
     select
         m.id,
-        (1 - (m.embedding::halfvec(512) <=> query_embedding::halfvec(512)))::float as similarity
+        (1 - (m.embedding::halfvec(512) <=> query_embedding::halfvec(512)))::float as similarity,
+        row_number() over (order by m.embedding::halfvec(512) <=> query_embedding::halfvec(512)) as rank_ix
     from memories m
-    where m.profile = filter_profile
+    where (filter_profiles is not null and m.profile = any(filter_profiles)
+           or filter_profiles is null and m.profile = filter_profile)
       and (filter_tags is null or m.tags && filter_tags)
       and (filter_source is null or m.source = filter_source)
       and (m.expires_at is null or m.expires_at > now())
@@ -378,9 +514,11 @@ with semantic as (
 keyword as (
     select
         m.id,
-        ts_rank_cd(m.fts, websearch_to_tsquery(query_text))::float as keyword_rank
+        ts_rank_cd(m.fts, websearch_to_tsquery(query_text), 34)::float as keyword_rank,
+        row_number() over (order by ts_rank_cd(m.fts, websearch_to_tsquery(query_text), 34) desc) as rank_ix
     from memories m
-    where m.profile = filter_profile
+    where (filter_profiles is not null and m.profile = any(filter_profiles)
+           or filter_profiles is null and m.profile = filter_profile)
       and m.fts @@ websearch_to_tsquery(query_text)
       and (filter_tags is null or m.tags && filter_tags)
       and (filter_source is null or m.source = filter_source)
@@ -393,9 +531,10 @@ fused as (
         coalesce(s.id, k.id) as id,
         coalesce(s.similarity, 0.0) as similarity,
         coalesce(k.keyword_rank, 0.0) as keyword_rank,
+        -- Reciprocal Rank Fusion: position-based, score-agnostic
         (
-            semantic_weight * coalesce(s.similarity, 0.0)
-            + full_text_weight * coalesce(k.keyword_rank, 0.0)
+            semantic_weight * (1.0 / (rrf_k + coalesce(s.rank_ix, match_count * 3)))
+            + full_text_weight * (1.0 / (rrf_k + coalesce(k.rank_ix, match_count * 3)))
         ) as score
     from semantic s
     full outer join keyword k on s.id = k.id
@@ -405,9 +544,17 @@ select
     f.similarity, f.keyword_rank,
     (
         f.score
+        * m.importance
         * (1.0 + ln(m.access_count + 1.0) * 0.1)
         * m.confidence
         * (1.0 + g.graph_boost * 0.2)
+        * (1.0 + case
+            when query_entity_tags is null or cardinality(query_entity_tags) = 0 then 0.0
+            else (select count(*)::float from unnest(query_entity_tags) qt
+                  where qt = any(m.tags))
+                 / cardinality(query_entity_tags) * 0.4
+          end)
+        * exp(-recency_decay * extract(epoch from (now() - m.created_at)) / 86400.0)
     )::float as relevance,
     m.access_count, m.last_accessed_at, m.confidence, m.created_at, m.updated_at
 from fused f
@@ -560,36 +707,84 @@ as $$
 declare
     result jsonb;
 begin
-    select jsonb_build_object(
+    WITH active_memories AS (
+        SELECT id, source, tags, importance, last_accessed_at
+        FROM memories
+        WHERE profile = filter_profile
+          AND (expires_at IS NULL OR expires_at > now())
+    ),
+    related_active_memories AS (
+        SELECT mr.source_id AS memory_id
+        FROM memory_relationships mr
+        JOIN active_memories source_mem ON source_mem.id = mr.source_id
+        JOIN active_memories target_mem ON target_mem.id = mr.target_id
+        WHERE mr.source_id <> mr.target_id
+        UNION
+        SELECT mr.target_id AS memory_id
+        FROM memory_relationships mr
+        JOIN active_memories source_mem ON source_mem.id = mr.source_id
+        JOIN active_memories target_mem ON target_mem.id = mr.target_id
+        WHERE mr.source_id <> mr.target_id
+    ),
+    tag_rows AS (
+        SELECT unnest(tags) AS tag
+        FROM active_memories
+        WHERE tags IS NOT NULL AND cardinality(tags) > 0
+    )
+    SELECT jsonb_build_object(
         'profile', filter_profile,
-        'total', (
-            select count(*) from memories
-            where profile = filter_profile
-              and (expires_at is null or expires_at > now())
-        ),
-        'sources', (
-            select jsonb_object_agg(source, cnt)
-            from (
-                select coalesce(source, 'unknown') as source, count(*) as cnt
-                from memories
-                where profile = filter_profile
-                  and (expires_at is null or expires_at > now())
-                group by source
+        'total', (SELECT count(*) FROM active_memories),
+        'sources', COALESCE((
+            SELECT jsonb_object_agg(source, cnt)
+            FROM (
+                SELECT coalesce(source, 'unknown') AS source, count(*) AS cnt
+                FROM active_memories
+                GROUP BY coalesce(source, 'unknown')
             ) s
-        ),
-        'top_tags', (
-            select jsonb_agg(jsonb_build_object('tag', tag, 'count', cnt))
-            from (
-                select tag, count(*) as cnt
-                from memories, unnest(tags) as tag
-                where profile = filter_profile
-                  and (expires_at is null or expires_at > now())
-                group by tag
-                order by cnt desc
-                limit 20
+        ), '{}'::jsonb),
+        'top_tags', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('tag', tag, 'count', cnt))
+            FROM (
+                SELECT tag, count(*) AS cnt
+                FROM tag_rows
+                GROUP BY tag
+                ORDER BY cnt DESC, tag
+                LIMIT 20
             ) t
+        ), '[]'::jsonb),
+        'relationships', jsonb_build_object(
+            'orphan_count', (
+                SELECT count(*)
+                FROM active_memories m
+                LEFT JOIN related_active_memories ram ON ram.memory_id = m.id
+                WHERE ram.memory_id IS NULL
+            )
+        ),
+        'tagging', jsonb_build_object(
+            'untagged_count', (
+                SELECT count(*)
+                FROM active_memories
+                WHERE tags IS NULL OR cardinality(tags) = 0
+            ),
+            'distinct_tag_count', (SELECT count(DISTINCT tag) FROM tag_rows)
+        ),
+        'decay', jsonb_build_object(
+            'eligible_count', (
+                SELECT count(*)
+                FROM active_memories
+                WHERE importance > 0.05
+                  AND (
+                      last_accessed_at IS NULL
+                      OR last_accessed_at < now() - interval '7 days'
+                  )
+            ),
+            'floor_count', (
+                SELECT count(*)
+                FROM active_memories
+                WHERE importance <= 0.05
+            )
         )
-    ) into result;
+    ) INTO result;
 
     return result;
 end;
@@ -732,3 +927,194 @@ BEGIN
     LIMIT result_limit;
 END;
 $$;
+
+-- ── Audit log (append-only event trail) ────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_time timestamptz NOT NULL DEFAULT now(),
+    profile text NOT NULL,
+    operation text NOT NULL,
+    resource_id uuid,
+    outcome text NOT NULL DEFAULT 'success',
+    source text,
+    embedding_model text,
+    tokens_used integer,
+    cost_usd numeric(10,6),
+    result_ids uuid[],
+    result_count integer,
+    query_hash text,
+    metadata jsonb DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_profile_time
+    ON audit_log (profile, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_resource
+    ON audit_log (resource_id) WHERE resource_id IS NOT NULL;
+
+-- ── Entity graph (spreading activation substrate) ─────────────────────
+
+CREATE TABLE IF NOT EXISTS entities (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    canonical_name text NOT NULL,
+    entity_type text NOT NULL,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    mention_count integer NOT NULL DEFAULT 0,
+    temporal_span float NOT NULL DEFAULT 1.0,
+    session_count integer NOT NULL DEFAULT 1,
+    UNIQUE (canonical_name, entity_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_type_name
+    ON entities (entity_type, canonical_name);
+CREATE INDEX IF NOT EXISTS idx_entities_canonical_type
+    ON entities (canonical_name, entity_type);
+
+CREATE TABLE IF NOT EXISTS memory_entities (
+    memory_id uuid NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    entity_id bigint NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    profile text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (memory_id, entity_id)
+);
+
+-- RLS for entity tables
+ALTER TABLE entities ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entities FORCE ROW LEVEL SECURITY;
+CREATE POLICY "Deny anon access" ON entities
+    FOR ALL TO anon USING (false) WITH CHECK (false);
+
+ALTER TABLE memory_entities ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memory_entities FORCE ROW LEVEL SECURITY;
+CREATE POLICY "Deny anon access" ON memory_entities
+    FOR ALL TO anon USING (false) WITH CHECK (false);
+
+CREATE INDEX IF NOT EXISTS idx_memory_entities_memory
+    ON memory_entities (memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_entities_entity_profile
+    ON memory_entities (entity_id, profile);
+
+-- Refresh temporal span for a single entity
+CREATE OR REPLACE FUNCTION refresh_entity_temporal_span(target_entity_id bigint)
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public, extensions
+AS $$
+    UPDATE entities SET
+        session_count = sub.cnt,
+        temporal_span = ln(1.0 + sub.cnt)
+    FROM (
+        SELECT COUNT(DISTINCT DATE_TRUNC('day', m.created_at)) AS cnt
+        FROM memory_entities me
+        JOIN memories m ON m.id = me.memory_id
+        WHERE me.entity_id = target_entity_id
+    ) sub
+    WHERE id = target_entity_id;
+$$;
+
+-- Spreading activation over the bipartite entity/memory graph
+CREATE OR REPLACE FUNCTION spread_entity_activation_memories(
+    seed_entity_tags text[],
+    filter_profile text,
+    max_depth int DEFAULT 2,
+    decay float DEFAULT 0.65,
+    min_activation float DEFAULT 0.1,
+    max_results int DEFAULT 50
+) RETURNS TABLE (memory_id uuid, activation float)
+LANGUAGE plpgsql STABLE
+SECURITY DEFINER
+SET search_path = public, extensions
+AS $$
+BEGIN
+    RETURN QUERY
+    WITH RECURSIVE
+    seeds AS (
+        SELECT DISTINCT e.id, e.temporal_span
+        FROM entities e
+        JOIN LATERAL unnest(seed_entity_tags) AS t ON true
+        WHERE e.canonical_name = split_part(t, ':', 2)
+          AND e.entity_type = split_part(t, ':', 1)
+        LIMIT 6
+    ),
+    walk AS (
+        SELECT s.id AS entity_id, 1.0::float AS activation, 0 AS depth
+        FROM seeds s
+        UNION ALL
+        SELECT e2.id AS entity_id,
+               LEAST(1.0,
+                 w.activation * decay
+                 * LEAST(e2.temporal_span, 3.0)
+                 * (1.0 / ln(1.0 + GREATEST(e2.mention_count, 1)))
+               )::float AS activation,
+               w.depth + 1 AS depth
+        FROM walk w
+        JOIN memory_entities me1 ON me1.entity_id = w.entity_id
+                                AND me1.profile = filter_profile
+        JOIN memory_entities me2 ON me2.memory_id = me1.memory_id
+                                AND me2.entity_id != w.entity_id
+                                AND me2.profile = filter_profile
+        JOIN entities e2 ON e2.id = me2.entity_id
+        WHERE w.depth < max_depth
+          AND w.activation * decay
+              * LEAST(e2.temporal_span, 3.0)
+              * (1.0 / ln(1.0 + GREATEST(e2.mention_count, 1)))
+              > min_activation
+    ),
+    activated_entities AS (
+        SELECT w2.entity_id, max(w2.activation) AS activation
+        FROM walk w2
+        GROUP BY w2.entity_id
+    ),
+    activated_memories AS (
+        SELECT me.memory_id, max(ae.activation) AS activation
+        FROM activated_entities ae
+        JOIN memory_entities me ON me.entity_id = ae.entity_id
+                               AND me.profile = filter_profile
+        GROUP BY me.memory_id
+    )
+    SELECT am.memory_id, am.activation
+    FROM activated_memories am
+    ORDER BY am.activation DESC
+    LIMIT max_results;
+END;
+$$;
+
+-- v0.14: lock down entity-graph SECURITY DEFINER functions to service_role
+-- only. These bypass RLS by design and were never meant to be part of
+-- the public REST surface. Migration 037 keeps existing deployments in
+-- sync with this schema-time grant. See migration 037 header for the
+-- full rationale.
+REVOKE EXECUTE ON FUNCTION refresh_entity_temporal_span(bigint) FROM anon, authenticated, PUBLIC;
+REVOKE EXECUTE ON FUNCTION spread_entity_activation_memories(text[], text, integer, double precision, double precision, integer) FROM anon, authenticated, PUBLIC;
+
+-- =====================================================
+-- PostgREST / Supabase Data API grants (added 2026-05)
+-- =====================================================
+-- On 2026-04-28 Supabase announced that tables created in `public`
+-- will no longer be auto-exposed to the Data API. The change becomes
+-- the default for new projects on 2026-05-30 and is enforced on all
+-- existing projects on 2026-10-30.
+-- Source: https://github.com/orgs/supabase/discussions/45329
+--
+-- Ogham's Python backend talks to Supabase via PostgREST using the
+-- service_role / sb_secret_ key. Without explicit table-level
+-- GRANTs, PostgREST returns "42501: permission denied" once Supabase
+-- revokes its platform-level default grant.
+--
+-- Granted to service_role only. anon is blocked at the RLS layer
+-- ("Deny anon access" policies on every table) and locked out of RPC
+-- EXECUTE in migration 037. authenticated is unused by Ogham.
+--
+-- Migration 038_data_api_grants.sql provides the upgrade path for
+-- existing self-hosted installs and also covers topic_summaries +
+-- topic_summary_sources (created by migration 028).
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.memories             TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.profile_settings     TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.memory_lifecycle     TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.memory_relationships TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.audit_log            TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.entities             TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.memory_entities      TO service_role;
+
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO service_role;

@@ -1,4 +1,5 @@
 import logging
+from typing import Any, cast
 
 from ogham.config import settings
 from ogham.database import get_backend
@@ -9,7 +10,7 @@ logger = logging.getLogger(__name__)
 def check_database() -> dict[str, str | bool]:
     """Check database connectivity with a lightweight query."""
     try:
-        backend = get_backend()
+        backend = cast(Any, get_backend())
         if hasattr(backend, "_get_client"):
             # Supabase backend
             client = backend._get_client()
@@ -106,6 +107,49 @@ def check_embedding_provider() -> dict[str, str | bool]:
                 "hint": f"Voyage supports: {sorted(valid_voyage_dims)}",
             }
         return {"status": "ok", "provider": "voyage"}
+
+    elif provider == "gemini":
+        try:
+            from google import genai  # pyright: ignore[reportAttributeAccessIssue]  # noqa: F401
+        except ImportError:
+            return {
+                "status": "error",
+                "provider": "gemini",
+                "error": "google-genai package not installed",
+                "hint": 'Install with: pip install "ogham-mcp[gemini]"',
+            }
+        if not settings.gemini_api_key:
+            return {
+                "status": "error",
+                "provider": "gemini",
+                "error": "GEMINI_API_KEY not set",
+            }
+        return {"status": "ok", "provider": "gemini"}
+
+    elif provider == "onnx":
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError:
+            return {
+                "status": "error",
+                "provider": "onnx",
+                "error": "onnxruntime package not installed",
+                "hint": "Install with: uv add onnxruntime",
+            }
+        from pathlib import Path
+
+        model_path = settings.onnx_model_path
+        if not model_path:
+            # Use same default as onnx_embedder._get_model()
+            model_path = str(Path.home() / ".cache" / "ogham" / "bge-m3-onnx" / "bge_m3_model.onnx")
+
+        if not Path(model_path).exists():
+            return {
+                "status": "error",
+                "provider": "onnx",
+                "error": f"Model not found: {model_path}",
+            }
+        return {"status": "ok", "provider": "onnx", "model_path": model_path}
 
     return {"status": "unknown", "provider": provider}
 
